@@ -80,7 +80,7 @@ jobs:
           if-no-files-found: error
 
   agent:
-    name: agent / android arm64
+    name: agent / android arm64 + x86_64
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -111,27 +111,42 @@ jobs:
           echo "using NDK at $NDK"
           ls "$NDK/build/cmake/android.toolchain.cmake"
 
-      - name: configure
+      - name: configure arm64
         run: |
-          cmake -S agent -B agent/build \
+          cmake -S agent -B agent/build-arm64 \
             -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
             -DANDROID_ABI=arm64-v8a \
             -DANDROID_PLATFORM=android-21 \
             -DANDROID_STL=c++_static \
             -DCMAKE_BUILD_TYPE=Release
 
-      - name: build
-        run: cmake --build agent/build --parallel
+      - name: build arm64
+        run: cmake --build agent/build-arm64 --parallel
 
-      - name: check output
+      - name: configure x86_64
         run: |
-          ls -l agent/build/s2sc_agent
-          file agent/build/s2sc_agent || true
+          cmake -S agent -B agent/build-x64 \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=x86_64 \
+            -DANDROID_PLATFORM=android-21 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: build x86_64
+        run: cmake --build agent/build-x64 --parallel
+
+      - name: stage
+        run: |
+          mkdir -p out
+          cp agent/build-arm64/s2sc_agent out/s2sc_agent_arm64
+          cp agent/build-x64/s2sc_agent out/s2sc_agent_x64
+          ls -l out
+          file out/s2sc_agent_arm64 out/s2sc_agent_x64 || true
 
       - uses: actions/upload-artifact@v4
         with:
           name: s2sc-agent
-          path: agent/build/s2sc_agent
+          path: out/*
           if-no-files-found: error
 
   package:

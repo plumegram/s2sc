@@ -10,18 +10,20 @@ if "%ANDROID_NDK%"=="" (
     exit /b 1
 )
 
-set OUT=%~dp0build
-cmake -S "%~dp0." -B "%OUT%" ^
-    -G Ninja ^
-    -DCMAKE_TOOLCHAIN_FILE="%ANDROID_NDK%\build\cmake\android.toolchain.cmake" ^
-    -DANDROID_ABI=arm64-v8a ^
-    -DANDROID_PLATFORM=android-21 ^
-    -DANDROID_STL=c++_static ^
-    -DCMAKE_BUILD_TYPE=Release
-if errorlevel 1 exit /b 1
+set TC=%ANDROID_NDK%\build\cmake\android.toolchain.cmake
 
-cmake --build "%OUT%" --config Release
-if errorlevel 1 exit /b 1
+for %%A in (arm64-v8a x86_64) do (
+    cmake -S "%~dp0." -B "%~dp0build-%%A" ^
+        -DCMAKE_TOOLCHAIN_FILE="%TC%" ^
+        -DANDROID_ABI=%%A ^
+        -DANDROID_PLATFORM=android-21 ^
+        -DANDROID_STL=c++_static ^
+        -DCMAKE_BUILD_TYPE=Release
+    if errorlevel 1 exit /b 1
+    cmake --build "%~dp0build-%%A" --parallel
+    if errorlevel 1 exit /b 1
+)
 
 echo.
-echo [s2sc] agent: %OUT%\s2sc_agent
+echo [s2sc] arm64 : %~dp0build-arm64-v8a\s2sc_agent
+echo [s2sc] x86_64: %~dp0build-x86_64\s2sc_agent

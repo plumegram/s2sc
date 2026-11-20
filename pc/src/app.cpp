@@ -35,6 +35,14 @@ std::string FindFile(const std::string& relative) {
     return JoinPath(dir, relative);
 }
 
+std::string PickExisting(const std::vector<std::string>& relatives) {
+    for (const std::string& rel : relatives) {
+        std::string p = FindFile(rel);
+        if (Exists(p)) return p;
+    }
+    return {};
+}
+
 } // namespace
 
 App::~App() {
@@ -88,7 +96,6 @@ bool App::Init() {
                  cfg.weapon_controller.owner.Get(), cfg.material_controller.weapon_id.Get(),
                  cfg.material_controller.skin_id.Get());
 
-    adb_agent_local = FindFile("agent\\build\\s2sc_agent");
     return true;
 }
 
@@ -113,8 +120,29 @@ bool App::ConnectDevice() {
     adb.SetSerial(devices[device_index].serial);
     log.Info("device: %s (%s)", adb.Serial().c_str(), devices[device_index].state.c_str());
 
+    // Emulators are x86_64, phones are arm64. Pick the matching agent binary;
+    // ARM translation would run the arm64 one on an emulator, but natively is
+    // faster and less fragile.
+    std::string abi, shell_err;
+    if (adb.Shell("getprop ro.product.cpu.abi", abi, shell_err))
+        log.Info("abi: %s", abi.c_str());
+    else
+        log.Warn("abi query failed: %s", shell_err.c_str());
+
+    const bool want_x64 = abi.find("x86") != std::string::npos || abi.find("i686") != std::string::npos;
+    agent_binary = want_x64
+        ? PickExisting({"agent\\build\\s2sc_agent_x64", "agent\\build\\s2sc_agent_arm64", "agent\\build\\s2sc_agent"})
+        : PickExisting({"agent\\build\\s2sc_agent_arm64", "agent\\build\\s2sc_agent_x64", "agent\\build\\s2sc_agent"});
+
+    root_mode = adb.ProbeRoot();
+    const bool use_su = (root_mode == 1);
+    if (root_mode == 0)
+        log.Warn("no root: su is missing and adbd is not root, /proc/<pid>/mem will be denied");
+    else
+        log.Info("root via %s", root_mode == 1 ? "su" : "adbd (already root)");
+
     // Kill a stale agent from a previous run so the port is free.
-    adb.Run("shell su -c \"pkill -f s2sc_agent\"", 8000);
+    adb.Run(std::string("shell ") + (use_su ? "su -c \"pkill -f s2sc_agent\"" : "pkill -f s2sc_agent"), 8000);
 
     if (!adb.Forward(cfg.port, cfg.port, err)) {
         log.Error("%s", err.c_str());
@@ -122,17 +150,17 @@ bool App::ConnectDevice() {
         return false;
     }
 
-    if (!adb_agent_local.empty() && Exists(adb_agent_local)) {
-        if (!adb.Push(adb_agent_local, cfg.remote_agent, err))
+    if (!agent_binary.empty()) {
+        if (!adb.Push(agent_binary, cfg.remote_agent, err))
             log.Warn("push failed: %s", err.c_str());
         else
-            log.Info("agent pushed to %s", cfg.remote_agent.c_str());
+            log.Info("agent pushed: %s", agent_binary.c_str());
     } else {
-        log.Warn("local agent binary not found at agent\\build\\s2sc_agent, assuming it is already on the device");
+        log.Warn("no local agent binary found under agent\\build, assuming it is already on the device");
     }
 
     std::string proc_err;
-    if (!agentProc.Start(adb, cfg.remote_agent, cfg.port, proc_err)) {
+    if (!agentProc.Start(adb, cfg.remote_agent, cfg.port, use_su, proc_err)) {
         log.Error("agent start: %s", proc_err.c_str());
         status_line = proc_err;
         return false;
@@ -171,8 +199,8 @@ void App::DisconnectDevice() {
     client.Disconnect();
     connected = false;
     agentProc.Stop();
-    // TerminateProcess on adb.exe does not reliably reap the remote su child.
-    adb.Run("shell su -c \"pkill -f s2sc_agent\"", 8000);
+    // TerminateProcess on adb.exe does not reliably reap the remote child.
+    adb.Run(std::string("shell ") + (root_mode == 1 ? "su -c \"pkill -f s2sc_agent\"" : "pkill -f s2sc_agent"), 8000);
     agent_running = false;
     adb.RemoveForward(cfg.port);
 }

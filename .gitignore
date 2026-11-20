@@ -1,7 +1,7 @@
 build/
-agent/build/
-.vs/
+agent/build*/
 out/
+.vs/
 *.user
 *.pdb
 *.ilk

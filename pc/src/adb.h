@@ -32,6 +32,10 @@ public:
     void       RemoveForward(int local_port) const;
     bool       Shell(const std::string& cmd, std::string& out, std::string& err) const;
 
+    // How this device can reach uid 0:
+    //   0 = no root, 1 = su binary works, 2 = adbd itself already runs as root
+    int ProbeRoot() const;
+
     void SetPath(std::string p) { m_path = std::move(p); }
     const std::string& Path() const { return m_path; }
     void SetSerial(std::string s) { m_serial = std::move(s); }
@@ -42,7 +46,7 @@ public:
     class AgentProcess {
     public:
         ~AgentProcess() { Stop(); }
-        bool Start(const Adb& adb, const std::string& remote_path, int port, std::string& err);
+        bool Start(const Adb& adb, const std::string& remote_path, int port, bool use_su, std::string& err);
         void Stop();
         bool Running() const { return m_running.load(); }
         std::string Output() const;

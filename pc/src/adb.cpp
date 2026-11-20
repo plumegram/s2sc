@@ -182,9 +182,17 @@ bool Adb::Shell(const std::string& cmd, std::string& out, std::string& err) cons
     return true;
 }
 
+int Adb::ProbeRoot() const {
+    std::string out, err;
+    if (Shell("su -c id", out, err) && out.find("uid=0") != std::string::npos) return 1;
+    if (Shell("id", out, err) && out.find("uid=0") != std::string::npos) return 2;
+    return 0;
+}
+
 // ---------------------------------------------------------------- AgentProcess
 
-bool Adb::AgentProcess::Start(const Adb& adb, const std::string& remote_path, int port, std::string& err) {
+bool Adb::AgentProcess::Start(const Adb& adb, const std::string& remote_path, int port, bool use_su,
+                              std::string& err) {
     Stop();
 
     SECURITY_ATTRIBUTES sa{sizeof(sa), nullptr, TRUE};
@@ -200,8 +208,14 @@ bool Adb::AgentProcess::Start(const Adb& adb, const std::string& remote_path, in
     si.hStdError   = wr;
 
     char inner[512];
-    std::snprintf(inner, sizeof(inner),
-                  "su -c 'chmod 755 %s; %s %d'", remote_path.c_str(), remote_path.c_str(), port);
+    if (use_su) {
+        std::snprintf(inner, sizeof(inner),
+                      "su -c 'chmod 755 %s; %s %d'", remote_path.c_str(), remote_path.c_str(), port);
+    } else {
+        // adbd is already root (adb root / userdebug build): no su needed.
+        std::snprintf(inner, sizeof(inner),
+                      "chmod 755 %s; %s %d", remote_path.c_str(), remote_path.c_str(), port);
+    }
 
     std::string cmdline = adb.Prefix() + " shell " + inner;
     std::vector<char> mutable_cmd(cmdline.begin(), cmdline.end());

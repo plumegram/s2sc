@@ -23,7 +23,8 @@ struct App {
     SkinDb     skins;
 
     std::string config_path;
-    std::string adb_agent_local; // built agent binary on this machine
+    std::string agent_binary; // agent picked for the attached device's ABI
+    int         root_mode = 0; // 0 none, 1 su, 2 adbd already root
 
     // connection
     Adb::AgentProcess agentProc;
