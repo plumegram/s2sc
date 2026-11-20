@@ -156,6 +156,7 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, PWSTR, int) {
         ImGui::NewFrame();
 
         app.PollScan();
+        app.PollWatch();
         DrawUI(app);
 
         ImGui::Render();

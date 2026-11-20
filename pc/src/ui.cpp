@@ -196,15 +196,16 @@ void DrawSkinchanger(App& app) {
     ImGui::Separator();
 
     if (app.has_target) {
-        ImGui::Text("obj 0x%llX  mc 0x%llX", static_cast<unsigned long long>(app.target.obj),
-                    static_cast<unsigned long long>(app.target.mc));
-        ImGui::Text("weapon %s   current skin %u", app.skins.WeaponNameById(app.target.weapon),
-                    app.target.skin);
+        ImGui::Text("obj 0x%llX  klass 0x%llX", static_cast<unsigned long long>(app.target.obj),
+                    static_cast<unsigned long long>(app.target.klass));
+        ImGui::Text("weapon %s   skin %u   ammo %u/%u   reserve %u",
+                    app.skins.WeaponNameById(app.target.weapon), app.target.skin,
+                    app.target.ammo, app.target.mag, app.target.reserve);
     } else {
         ImGui::TextColored(kDim, "target not selected");
         ImGui::SameLine();
-        if (ImGui::SmallButton("scan default skin")) {
-            app.scan_value = 0;
+        if (ImGui::SmallButton("scan structural")) {
+            app.scan_structural = true;
             app.StartScan();
         }
     }
@@ -219,7 +220,9 @@ void DrawSkinchanger(App& app) {
     ImGui::SameLine();
     ImGui::Checkbox("auto", &app.cfg.auto_apply);
 
-    if (app.has_target) {
+    if (app.watch_active) {
+        ImGui::TextColored(kAccent, "watching the write for 1 s: if the game rewrites it, the log says so");
+    } else if (app.has_target) {
         ImGui::TextColored(kDim, "write lands immediately, the view refreshes on the next weapon raise");
     }
 
@@ -251,17 +254,18 @@ void DrawTargets(App& app) {
     ImGui::SameLine();
     ImGui::TextDisabled("// build %s", app.cfg.build_tag.c_str());
 
-    DrawOffsetRow("weapon_controller.owner", app.cfg.weapon_controller.owner);
-    DrawOffsetRow("weapon_controller.material_controller", app.cfg.weapon_controller.material_controller);
-    DrawOffsetRow("weapon_controller.skin_id", app.cfg.weapon_controller.skin_id);
-    DrawOffsetRow("material_controller.weapon_id", app.cfg.material_controller.weapon_id);
-    DrawOffsetRow("material_controller.skin_id", app.cfg.material_controller.skin_id);
+    DrawOffsetRow("player_animation.weapon_id", app.cfg.player_animation.weapon_id);
+    DrawOffsetRow("player_animation.skin_id", app.cfg.player_animation.skin_id);
+    DrawOffsetRow("player_animation.magazine_capacity", app.cfg.player_animation.magazine_capacity);
+    DrawOffsetRow("player_animation.ammo", app.cfg.player_animation.ammo);
+    DrawOffsetRow("player_animation.rest_ammo", app.cfg.player_animation.rest_ammo);
 
     if (ImGui::Button("Save config")) app.SaveConfig();
     ImGui::SameLine();
     if (ImGui::Button("Validate target") && app.has_target) {
         WeaponInstance w;
         std::string why;
+        app.mem.SetLayout(app.cfg); // pick up offsets edited in this tab
         if (app.mem.Validate(app.target.obj, w, why))
             app.log.Ok("validation passed: weapon %s skin %u", app.skins.WeaponNameById(w.weapon), w.skin);
         else
@@ -273,6 +277,8 @@ void DrawTargets(App& app) {
     ImGui::SetNextItemWidth(140);
     int sv = static_cast<int>(app.scan_value);
     if (ImGui::InputInt("skin id to find", &sv)) app.scan_value = static_cast<uint32_t>(sv);
+    ImGui::SameLine();
+    ImGui::Checkbox("structural (ignore seed)", &app.scan_structural);
     ImGui::SameLine();
     if (!app.scan_running.load()) {
         if (ImGui::Button("Scan")) app.StartScan();
@@ -296,7 +302,7 @@ void DrawTargets(App& app) {
         ImGui::TableSetupColumn("obj");
         ImGui::TableSetupColumn("weapon");
         ImGui::TableSetupColumn("skin");
-        ImGui::TableSetupColumn("owner");
+        ImGui::TableSetupColumn("ammo");
         ImGui::TableHeadersRow();
 
         for (int i = 0; i < static_cast<int>(app.candidates.size()); ++i) {
@@ -318,7 +324,7 @@ void DrawTargets(App& app) {
             ImGui::TableNextColumn();
             ImGui::Text("%u", w.skin);
             ImGui::TableNextColumn();
-            ImGui::Text("0x%llX", static_cast<unsigned long long>(w.owner));
+            ImGui::Text("%u/%u", w.ammo, w.mag);
         }
         ImGui::EndTable();
     }
@@ -340,9 +346,9 @@ void DrawTargets(App& app) {
             }
         }
         ImGui::SameLine();
-        ImGui::TextDisabled("obj 0x%llX  mc 0x%llX",
+        ImGui::TextDisabled("obj 0x%llX  klass 0x%llX",
                             static_cast<unsigned long long>(app.target.obj),
-                            static_cast<unsigned long long>(app.target.mc));
+                            static_cast<unsigned long long>(app.target.klass));
     }
 
     if (!dump.empty()) {

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <cstdint>
 #include <mutex>
 #include <string>
@@ -57,6 +58,14 @@ struct App {
     std::string  skin_search;
     uint32_t     selected_skin = 0;
     uint32_t     scan_value = 0;
+    bool         scan_structural = false; // ignore the seed, match on the structure alone
+
+    // post-write watchdog: proves the game does not rewrite the field next tick
+    bool         watch_active = false;
+    uint64_t     watch_obj = 0;
+    uint32_t     watch_expected = 0;
+    std::chrono::steady_clock::time_point watch_start{};
+    std::chrono::steady_clock::time_point watch_next{};
 
     // misc ui
     char         manual_addr[32] = "0";
@@ -77,6 +86,10 @@ struct App {
     void PollScan();
     bool ApplySkin(uint32_t skin_id);
     bool RefreshTarget();
+
+    // Re-reads the skin field every 250 ms for a second after a write and logs
+    // whether the game kept the value. Called once per frame; never blocks.
+    void PollWatch();
 
     void SaveConfig();
     std::string ProcessName() const { return cfg.process_name; }

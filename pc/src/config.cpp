@@ -91,14 +91,12 @@ bool Config::Load(const std::string& path, std::string& err) {
     klass_in_module = root.Bool("klass_in_module", klass_in_module);
 
     if (const json::Value* layout = root.Find("layout")) {
-        if (const json::Value* wc = layout->Find("weapon_controller")) {
-            ReadOffset(*wc, "owner", weapon_controller.owner);
-            ReadOffset(*wc, "material_controller", weapon_controller.material_controller);
-            ReadOffset(*wc, "skin_id", weapon_controller.skin_id);
-        }
-        if (const json::Value* mc = layout->Find("material_controller")) {
-            ReadOffset(*mc, "weapon_id", material_controller.weapon_id);
-            ReadOffset(*mc, "skin_id", material_controller.skin_id);
+        if (const json::Value* pa = layout->Find("player_animation")) {
+            ReadOffset(*pa, "weapon_id", player_animation.weapon_id);
+            ReadOffset(*pa, "skin_id", player_animation.skin_id);
+            ReadOffset(*pa, "magazine_capacity", player_animation.magazine_capacity);
+            ReadOffset(*pa, "ammo", player_animation.ammo);
+            ReadOffset(*pa, "rest_ammo", player_animation.rest_ammo);
         }
     }
     return true;
@@ -119,14 +117,12 @@ bool Config::Save(const std::string& path, std::string& err) const {
     o << "  \"auto_apply\": " << (auto_apply ? "true" : "false") << ",\n";
     o << "  \"klass_in_module\": " << (klass_in_module ? "true" : "false") << ",\n";
     o << "  \"layout\": {\n";
-    o << "    \"weapon_controller\": {\n";
-    o << "      \"owner\": " << OffsetToJson(weapon_controller.owner) << ",\n";
-    o << "      \"material_controller\": " << OffsetToJson(weapon_controller.material_controller) << ",\n";
-    o << "      \"skin_id\": " << OffsetToJson(weapon_controller.skin_id) << "\n";
-    o << "    },\n";
-    o << "    \"material_controller\": {\n";
-    o << "      \"weapon_id\": " << OffsetToJson(material_controller.weapon_id) << ",\n";
-    o << "      \"skin_id\": " << OffsetToJson(material_controller.skin_id) << "\n";
+    o << "    \"player_animation\": {\n";
+    o << "      \"weapon_id\": " << OffsetToJson(player_animation.weapon_id) << ",\n";
+    o << "      \"skin_id\": " << OffsetToJson(player_animation.skin_id) << ",\n";
+    o << "      \"magazine_capacity\": " << OffsetToJson(player_animation.magazine_capacity) << ",\n";
+    o << "      \"ammo\": " << OffsetToJson(player_animation.ammo) << ",\n";
+    o << "      \"rest_ammo\": " << OffsetToJson(player_animation.rest_ammo) << "\n";
     o << "    }\n";
     o << "  }\n";
     o << "}\n";
@@ -142,10 +138,10 @@ std::string Config::DescribeMissing() const {
     auto add = [&](const char* name, const Offset& o) {
         if (!o) { if (!s.empty()) s += ", "; s += name; }
     };
-    add("weapon_controller.owner", weapon_controller.owner);
-    add("weapon_controller.material_controller", weapon_controller.material_controller);
-    add("weapon_controller.skin_id", weapon_controller.skin_id);
-    add("material_controller.weapon_id", material_controller.weapon_id);
-    add("material_controller.skin_id", material_controller.skin_id);
+    add("player_animation.weapon_id", player_animation.weapon_id);
+    add("player_animation.skin_id", player_animation.skin_id);
+    add("player_animation.magazine_capacity", player_animation.magazine_capacity);
+    add("player_animation.ammo", player_animation.ammo);
+    add("player_animation.rest_ammo", player_animation.rest_ammo);
     return s;
 }

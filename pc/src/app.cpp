@@ -116,10 +116,10 @@ bool App::Init() {
     if (!cfg.LayoutComplete())
         log.Warn("layout incomplete, missing: %s", cfg.DescribeMissing().c_str());
     else
-        log.Info("layout: wc.skin=0x%X wc.mc=0x%X wc.owner=0x%X mc.weapon=0x%X mc.skin=0x%X",
-                 cfg.weapon_controller.skin_id.Get(), cfg.weapon_controller.material_controller.Get(),
-                 cfg.weapon_controller.owner.Get(), cfg.material_controller.weapon_id.Get(),
-                 cfg.material_controller.skin_id.Get());
+        log.Info("layout: weapon=0x%X skin=0x%X mag=0x%X ammo=0x%X reserve=0x%X",
+                 cfg.player_animation.weapon_id.Get(), cfg.player_animation.skin_id.Get(),
+                 cfg.player_animation.magazine_capacity.Get(), cfg.player_animation.ammo.Get(),
+                 cfg.player_animation.rest_ammo.Get());
 
     return true;
 }
@@ -309,7 +309,13 @@ void App::DetachGame() {
 void App::StartScan() {
     if (!attached) { status_line = "not attached"; return; }
     if (scan_running.load()) return;
-    if (!cfg.weapon_controller.skin_id) { status_line = "layout incomplete"; return; }
+    // The targets tab edits cfg directly, so the offsets in the UI may be newer
+    // than the copy the reader holds.
+    mem.SetLayout(cfg);
+    if (!cfg.player_animation.weapon_id || !cfg.player_animation.skin_id) {
+        status_line = "layout incomplete";
+        return;
+    }
 
     if (scan_thread.joinable()) scan_thread.join();
 
@@ -318,16 +324,18 @@ void App::StartScan() {
     scan_total   = 1;
     scan_running = true;
 
-    uint32_t value = scan_value;
-    scan_thread = std::thread([this, value]() {
+    const uint32_t value      = scan_value;
+    const bool     structural = scan_structural;
+    scan_thread = std::thread([this, value, structural]() {
         std::vector<WeaponInstance> hits;
-        mem.ScanForSkin(
-            value, hits,
-            [this](uint64_t done, uint64_t total) {
-                scan_done  = done;
-                scan_total = total ? total : 1;
-            },
-            scan_cancel);
+        auto progress = [this](uint64_t done, uint64_t total) {
+            scan_done  = done;
+            scan_total = total ? total : 1;
+        };
+        if (structural)
+            mem.ScanStructural(hits, progress, scan_cancel);
+        else
+            mem.ScanForSkin(value, hits, progress, scan_cancel);
 
         {
             std::lock_guard<std::mutex> lock(scan_mutex);
@@ -347,7 +355,7 @@ void App::PollScan() {
     has_target = false;
 
     if (candidates.empty()) {
-        log.Warn("scan: no structurally valid weapon objects for skin %u", scan_value);
+        log.Warn("scan: no structurally valid objects");
         status_line = "scan: 0 hits";
     } else {
         log.Ok("scan: %zu candidate(s)", candidates.size());
@@ -358,13 +366,14 @@ void App::PollScan() {
 
 bool App::ApplySkin(uint32_t skin_id) {
     if (!has_target) { status_line = "no target"; return false; }
+    mem.SetLayout(cfg);
 
     // The weapon view can be rebuilt on a weapon switch, leaving the cached
     // pointers dangling. Re-validate before every write so we never poke a freed
     // object.
     WeaponInstance fresh;
     std::string why;
-    if (!mem.Validate(target.obj, fresh, why)) {
+    if (!mem.Validate(target.obj, fresh, why, /*strict=*/false)) {
         log.Error("target is stale (%s), re-scan needed", why.c_str());
         has_target = false;
         status_line = "target stale";
@@ -383,11 +392,53 @@ bool App::ApplySkin(uint32_t skin_id) {
     log.Ok("skin %u written to weapon %s (obj 0x%llX)", skin_id,
            skins.WeaponNameById(target.weapon), static_cast<unsigned long long>(target.obj));
     status_line = "applied";
+
+    watch_active   = true;
+    watch_obj      = target.obj;
+    watch_expected = skin_id;
+    watch_start    = std::chrono::steady_clock::now();
+    watch_next     = watch_start;
     return true;
+}
+
+void App::PollWatch() {
+    if (!watch_active) return;
+    if (!attached) { watch_active = false; return; }
+    if (!cfg.player_animation.skin_id) { watch_active = false; return; }
+
+    const auto now = std::chrono::steady_clock::now();
+    if (now < watch_next) return;
+    watch_next = now + std::chrono::milliseconds(250);
+
+    uint32_t v = 0;
+    if (!mem.ReadU32(watch_obj + cfg.player_animation.skin_id.Get(), v)) {
+        log.Warn("watch: the object stopped responding, it was freed or the weapon switched");
+        watch_active = false;
+        return;
+    }
+
+    const auto held = std::chrono::duration_cast<std::chrono::milliseconds>(now - watch_start).count();
+
+    if (v != watch_expected) {
+        // The game recomputes this field from its own state, so a single poke is
+        // not enough - this is the signal that the write path needs a hook.
+        log.Warn("watch: value reverted to %u after %lld ms, the game rewrites +0x%X",
+                 v, static_cast<long long>(held), cfg.player_animation.skin_id.Get());
+        status_line = "reverted";
+        watch_active = false;
+        return;
+    }
+
+    if (held >= 1000) {
+        log.Ok("watch: skin %u held for %lld ms at obj 0x%llX", v, static_cast<long long>(held),
+               static_cast<unsigned long long>(watch_obj));
+        watch_active = false;
+    }
 }
 
 bool App::RefreshTarget() {
     if (!has_target) return false;
+    mem.SetLayout(cfg);
     uint32_t v = 0;
     if (!mem.ReadSkin(target, v)) {
         log.Error("read skin failed");

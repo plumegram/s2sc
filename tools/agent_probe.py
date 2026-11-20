@@ -76,8 +76,10 @@ def attach(sock, pid):
 def regions(sock):
     _, body = call(sock, OP_REGIONS)
     out = []
-    for off in range(0, len(body) - 55, 56):
-        start, end, prot, foff, name = struct.unpack_from("<QQII32s", body, off)
+    # RegionEntry: u64 start, u64 end, u32 prot, u32 offset, char name[128]
+    stride = struct.calcsize("<QQII128s")
+    for off in range(0, len(body) - stride + 1, stride):
+        start, end, prot, foff, name = struct.unpack_from("<QQII128s", body, off)
         out.append((start, end, prot, foff, name.split(b"\0")[0].decode(errors="replace")))
     return out
 

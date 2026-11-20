@@ -10,19 +10,27 @@ using namespace s2sc;
 
 namespace {
 
+// A structural scan of a live heap can surface thousands of look-alikes; the UI
+// only needs enough of them to pick the right object.
+constexpr size_t kMaxCandidates = 512;
+
 bool PlausiblePtr(uint64_t p) {
-    // 4 KB aligned-down, inside the 47-bit user address space Android uses.
+    // 8-byte aligned, inside the 47-bit user address space Android uses.
     return p >= 0x10000ull && p < 0x00007fffffffffffull && (p % 8) == 0;
 }
 
-bool ReadableName(const RegionEntry& r) {
+// Managed objects live on the GC heap, which shows up as anonymous mappings,
+// [heap] or ashmem. App images are included because a few long-lived containers
+// sit in static fields inside libunity itself.
+bool ScannableRegion(const RegionEntry& r) {
     if (!(r.prot & kProtRead)) return false;
+    if (r.prot & kProtExec) return false; // code, not data
     const std::string name(r.name, strnlen(r.name, sizeof(r.name)));
     if (name == "[stack]" || name == "[vvar]" || name == "[vdso]" || name == "[vectors]") return false;
-    if (name == "[heap]" || name.empty()) return true;
+    if (name.empty() || name == "[heap]") return true;
     if (name.rfind("[anon", 0) == 0) return true;
-    if (name.find("libil2cpp") != std::string::npos) return true;
     if (name.find("/dev/ashmem") != std::string::npos) return true;
+    if (name.find("libunity") != std::string::npos) return true;
     return false;
 }
 
@@ -81,166 +89,188 @@ bool ProcMem::ReadRange(uint64_t addr, void* dst, uint32_t len) {
     return true;
 }
 
-bool ProcMem::Validate(uint64_t obj, WeaponInstance& out, std::string& why) {
+bool ProcMem::Validate(uint64_t obj, WeaponInstance& out, std::string& why, bool strict) {
     why.clear();
-    if (!m_module.valid) { why = "module span unknown"; return false; }
+    const LayoutPlayerAnimation& L = m_cfg.player_animation;
+    if (!L.weapon_id || !L.skin_id) { why = "layout incomplete"; return false; }
     if (!PlausiblePtr(obj)) { why = "object pointer implausible"; return false; }
-    if (!m_cfg.weapon_controller.skin_id || !m_cfg.weapon_controller.material_controller ||
-        !m_cfg.weapon_controller.owner) {
-        why = "layout incomplete";
-        return false;
-    }
 
-    uint32_t span = std::max<uint32_t>(m_cfg.weapon_controller.skin_id.Get() + 8, 0x100);
+    uint32_t span = 0x100;
+    span = std::max<uint32_t>(span, L.weapon_id.Get() + 4);
+    span = std::max<uint32_t>(span, L.skin_id.Get() + 8);
+    if (L.magazine_capacity) span = std::max<uint32_t>(span, L.magazine_capacity.Get() + 4);
+    if (L.ammo)              span = std::max<uint32_t>(span, L.ammo.Get() + 4);
+    if (L.rest_ammo)         span = std::max<uint32_t>(span, L.rest_ammo.Get() + 4);
+
     std::vector<uint8_t> buf(span, 0);
     if (!ReadRange(obj, buf.data(), span)) { why = "object header unreadable"; return false; }
 
-    auto u64_at = [&](uint32_t off) -> uint64_t {
-        uint64_t v = 0;
-        std::memcpy(&v, buf.data() + off, sizeof(v));
+    auto u8_at = [&](uint32_t off) -> uint32_t {
+        return off < buf.size() ? buf[off] : 0u;
+    };
+    auto u16_at = [&](uint32_t off) -> uint32_t {
+        uint16_t v = 0;
+        if (off + sizeof(v) <= buf.size()) std::memcpy(&v, buf.data() + off, sizeof(v));
         return v;
     };
     auto u32_at = [&](uint32_t off) -> uint32_t {
         uint32_t v = 0;
-        std::memcpy(&v, buf.data() + off, sizeof(v));
+        if (off + sizeof(v) <= buf.size()) std::memcpy(&v, buf.data() + off, sizeof(v));
         return v;
     };
+    uint64_t klass = 0;
+    std::memcpy(&klass, buf.data(), sizeof(klass));
 
-    uint64_t klass = u64_at(0);
     if (!PlausiblePtr(klass)) { why = "klass pointer implausible"; return false; }
-    if (m_cfg.klass_in_module && (klass < m_module.base || klass >= m_module.base + m_module.size)) {
-        why = "klass pointer outside libil2cpp (klass_in_module is on)";
+    if (m_cfg.klass_in_module && m_module.valid &&
+        (klass < m_module.base || klass >= m_module.base + m_module.size)) {
+        why = "klass pointer outside module (klass_in_module is on)";
         return false;
     }
 
-    uint64_t owner = u64_at(m_cfg.weapon_controller.owner.Get());
-    if (!PlausiblePtr(owner)) { why = "owner pointer implausible"; return false; }
+    // WeaponId is a struct wrapping a single byte, so the id is one byte wide.
+    const uint32_t weapon = u8_at(L.weapon_id.Get());
+    if (weapon == 0 || weapon > 80) { why = "weapon id out of range"; return false; }
 
-    uint64_t mc = u64_at(m_cfg.weapon_controller.material_controller.Get());
-    if (!PlausiblePtr(mc)) { why = "material controller pointer implausible"; return false; }
+    const uint32_t skin = u32_at(L.skin_id.Get());
 
-    uint32_t skin = u32_at(m_cfg.weapon_controller.skin_id.Get());
+    uint32_t mag = 0, ammo = 0, reserve = 0;
+    if (L.magazine_capacity) mag = u8_at(L.magazine_capacity.Get());
+    if (L.ammo)              ammo = u8_at(L.ammo.Get());
+    if (L.rest_ammo)         reserve = u16_at(L.rest_ammo.Get());
 
-    uint8_t mcbuf[0x40] = {0};
-    if (!ReadRange(mc, mcbuf, sizeof(mcbuf))) { why = "material controller unreadable"; return false; }
+    // A knife and a grenade have no magazine, so 0 is a legitimate capacity; it
+    // only has to be consistent with the ammo counters.
+    if (strict) {
+        if (L.magazine_capacity && mag > 100) { why = "magazine capacity out of range"; return false; }
+        if (L.ammo && L.magazine_capacity) {
+            if (mag == 0 && ammo != 0) { why = "ammo without a magazine"; return false; }
+            if (mag > 0 && ammo > mag) { why = "ammo exceeds magazine"; return false; }
+        }
+        if (L.rest_ammo && reserve > 999) { why = "reserve ammo out of range"; return false; }
+    }
 
-    uint64_t klass2 = 0;
-    std::memcpy(&klass2, mcbuf, sizeof(klass2));
-    if (!PlausiblePtr(klass2)) { why = "material controller klass implausible"; return false; }
-
-    uint32_t weapon = 0, skin2 = 0;
-    if (m_cfg.material_controller.weapon_id)
-        std::memcpy(&weapon, mcbuf + m_cfg.material_controller.weapon_id.Get(), sizeof(weapon));
-    if (m_cfg.material_controller.skin_id)
-        std::memcpy(&skin2, mcbuf + m_cfg.material_controller.skin_id.Get(), sizeof(skin2));
-
-    if (weapon > 200) { why = "weapon id out of range"; return false; }
-    if (m_cfg.material_controller.skin_id && skin2 != skin) { why = "skin id mismatch between objects"; return false; }
-
-    out.obj    = obj;
-    out.klass  = klass;
-    out.mc     = mc;
-    out.owner  = owner;
-    out.weapon = weapon;
-    out.skin   = skin;
+    out.obj     = obj;
+    out.klass   = klass;
+    out.weapon  = weapon;
+    out.skin    = skin;
+    out.mag     = mag;
+    out.ammo    = ammo;
+    out.reserve = reserve;
     return true;
 }
 
 bool ProcMem::ReadSkin(const WeaponInstance& w, uint32_t& out) {
-    if (!m_cfg.weapon_controller.skin_id) return false;
-    return ReadU32(w.obj + m_cfg.weapon_controller.skin_id.Get(), out);
+    const LayoutPlayerAnimation& L = m_cfg.player_animation;
+    if (!L.skin_id) return false;
+    return ReadU32(w.obj + L.skin_id.Get(), out);
 }
 
 bool ProcMem::WriteSkin(const WeaponInstance& w, uint32_t skin, std::string& err) {
-    if (!m_cfg.weapon_controller.skin_id || !m_cfg.material_controller.skin_id) {
-        err = "layout incomplete";
-        return false;
-    }
-    if (!WriteU32(w.obj + m_cfg.weapon_controller.skin_id.Get(), skin)) {
-        err = "write to WeaponController failed";
-        return false;
-    }
-    if (!WriteU32(w.mc + m_cfg.material_controller.skin_id.Get(), skin)) {
-        err = "write to WeaponMaterialController failed";
-        return false;
-    }
+    const LayoutPlayerAnimation& L = m_cfg.player_animation;
+    if (!L.skin_id) { err = "layout incomplete"; return false; }
+
+    const uint64_t addr = w.obj + L.skin_id.Get();
+    if (!WriteU32(addr, skin)) { err = "write to PlayerAnimationData failed"; return false; }
+
+    // A write that lands on a copy, or gets overwritten by the next tick, must be
+    // reported rather than shown as success.
+    uint32_t back = 0;
+    if (!ReadU32(addr, back)) { err = "read-back failed"; return false; }
+    if (back != skin) { err = "write did not stick (still " + std::to_string(back) + ")"; return false; }
     return true;
 }
 
-void ProcMem::ScanForSkin(uint32_t skin,
-                          std::vector<WeaponInstance>& out,
-                          const std::function<void(uint64_t, uint64_t)>& progress,
-                          std::atomic<bool>& cancel) {
+void ProcMem::ScanInternal(uint32_t seed, bool use_seed,
+                           std::vector<WeaponInstance>& out,
+                           const std::function<void(uint64_t, uint64_t)>& progress,
+                           std::atomic<bool>& cancel) {
     out.clear();
-    if (!m_cfg.weapon_controller.skin_id) return;
+    last_scan_report.clear();
+
+    const LayoutPlayerAnimation& L = m_cfg.player_animation;
+    if (!L.weapon_id || !L.skin_id) { last_scan_report = "layout incomplete"; return; }
 
     std::string err;
     std::vector<RegionEntry> regions;
-    if (!m_client.Regions(regions, err)) return;
+    if (!m_client.Regions(regions, err)) { last_scan_report = "regions: " + err; return; }
 
     std::vector<RegionEntry> targets;
     uint64_t total = 0;
     for (const RegionEntry& r : regions) {
-        if (!ReadableName(r)) continue;
+        if (!ScannableRegion(r)) continue;
         uint64_t size = r.end - r.start;
-        if (size == 0 || size > (512ull << 20)) continue;
+        // 2 GB: a single ART heap mapping can be large, and skipping it would
+        // silently lose the object we are looking for.
+        if (size == 0 || size > (2ull << 30)) continue;
         targets.push_back(r);
         total += size;
     }
 
-    const uint32_t CHUNK = 1u << 20;
-    std::vector<uint8_t> buf(CHUNK + 8);
+    const uint32_t CHUNK   = 1u << 20;
+    const uint32_t OVERLAP = 0x200; // so an object near the chunk edge is still whole
+    std::vector<uint8_t> buf(CHUNK + OVERLAP);
+
     std::unordered_set<uint64_t> seen;
     std::unordered_map<std::string, int> rejects;
     uint64_t done = 0;
 
+    const uint32_t skin_off   = L.skin_id.Get();
+    const uint32_t weapon_off = L.weapon_id.Get();
+    const uint32_t mag_off    = L.magazine_capacity ? L.magazine_capacity.Get() : 0;
+    const uint32_t ammo_off   = L.ammo ? L.ammo.Get() : 0;
+    const uint64_t mod_lo     = m_module.base;
+    const uint64_t mod_hi     = m_module.base + m_module.size;
+    const bool klass_module_only = m_cfg.klass_in_module && m_module.valid;
+
     for (const RegionEntry& r : targets) {
-        for (uint64_t off = 0; off < r.end - r.start; off += CHUNK) {
+        const uint64_t rsize = r.end - r.start;
+        for (uint64_t off = 0; off < rsize; off += CHUNK) {
             if (cancel.load()) return;
 
-            uint32_t len = static_cast<uint32_t>(std::min<uint64_t>(CHUNK, (r.end - r.start) - off));
-            uint64_t addr_base = r.start + off;
+            const uint32_t iter_len = static_cast<uint32_t>(std::min<uint64_t>(CHUNK, rsize - off));
+            const uint32_t read_len = static_cast<uint32_t>(std::min<uint64_t>(CHUNK + OVERLAP, rsize - off));
+            const uint64_t addr_base = r.start + off;
 
-            if (!ReadRange(addr_base, buf.data(), len)) {
-                done += len;
+            if (!ReadRange(addr_base, buf.data(), read_len)) {
+                done += iter_len;
                 if (progress) progress(done, total);
                 continue;
             }
 
-            const uint32_t skin_off = m_cfg.weapon_controller.skin_id.Get();
-            const uint32_t mc_off   = m_cfg.weapon_controller.material_controller.Get();
-            const uint64_t mod_lo   = m_module.base;
-            const uint64_t mod_hi   = m_module.base + m_module.size;
-            const bool     klass_module_only = m_cfg.klass_in_module;
+            // Reject a candidate using bytes that are already in the chunk, so the
+            // expensive Validate() round trip only runs on survivors. The dedup set
+            // is filled after these filters, not before: a structural scan walks
+            // every 8-aligned address in the heap, and inserting all of them would
+            // be billions of entries.
+            auto consider = [&](uint64_t obj) {
+                if (obj < addr_base) return;
+                const uint64_t local = obj - addr_base;
+                if (local + skin_off + 4 > read_len) return;
 
-            for (uint32_t i = 0; i + 4 <= len; i += 4) {
-                uint32_t v = 0;
-                std::memcpy(&v, buf.data() + i, sizeof(v));
-                if (v != skin) continue;
+                uint64_t klass = 0;
+                std::memcpy(&klass, buf.data() + local, sizeof(klass));
+                if (klass_module_only) {
+                    if (klass < mod_lo || klass >= mod_hi) return;
+                } else if (!PlausiblePtr(klass)) {
+                    return;
+                }
 
-                uint64_t addr = addr_base + i;
-                if (addr < skin_off) continue;
-                uint64_t obj = addr - skin_off;
-                if (!seen.insert(obj).second) continue;
-
-                // Free pre-filters, evaluated against the chunk already in memory:
-                // the klass pointer at obj+0 and the material controller pointer at
-                // obj+mc_off both sit before the hit, so no extra round trip is
-                // needed to reject the overwhelming majority of value matches.
-                if (i >= skin_off) {
-                    uint64_t klass = 0;
-                    std::memcpy(&klass, buf.data() + i - skin_off, sizeof(klass));
-                    if (klass_module_only) {
-                        if (klass < mod_lo || klass >= mod_hi) continue;
-                    } else if (!PlausiblePtr(klass)) {
-                        continue;
+                if (weapon_off < skin_off) {
+                    const uint32_t w = buf[local + weapon_off];
+                    if (w == 0 || w > 80) return;
+                }
+                if (mag_off > skin_off && local + mag_off < read_len) {
+                    const uint32_t m = buf[local + mag_off];
+                    if (m > 100) return;
+                    if (ammo_off > mag_off && local + ammo_off < read_len) {
+                        const uint32_t a = buf[local + ammo_off];
+                        if (m == 0 ? a != 0 : a > m) return;
                     }
                 }
-                if (mc_off <= skin_off && i >= skin_off - mc_off) {
-                    uint64_t mcptr = 0;
-                    std::memcpy(&mcptr, buf.data() + i - (skin_off - mc_off), sizeof(mcptr));
-                    if (!PlausiblePtr(mcptr)) continue;
-                }
+
+                if (!seen.insert(obj).second) return;
+                if (out.size() >= kMaxCandidates) return;
 
                 WeaponInstance w;
                 std::string why;
@@ -248,14 +278,30 @@ void ProcMem::ScanForSkin(uint32_t skin,
                     out.push_back(w);
                 else if (!why.empty())
                     rejects[why]++;
+            };
+
+            if (use_seed) {
+                for (uint32_t i = 0; i + 4 <= iter_len; i += 4) {
+                    uint32_t v = 0;
+                    std::memcpy(&v, buf.data() + i, sizeof(v));
+                    if (v != seed) continue;
+                    if (i < skin_off) continue;
+                    consider(addr_base + i - skin_off);
+                }
+            } else {
+                for (uint32_t i = 0; i + 4 <= iter_len; i += 4) {
+                    if ((addr_base + i) & 7ull) continue; // managed objects are 8-aligned
+                    consider(addr_base + i);
+                }
             }
-            done += len;
+
+            done += iter_len;
             if (progress) progress(done, total);
         }
     }
 
-    // Real weapon controllers share one Il2CppClass; sort so the dominant class
-    // group is at the top and the user does not have to hunt for it.
+    // Real instances share one Il2CppClass; sort so the dominant class group is
+    // at the top and the right object is the obvious pick.
     std::unordered_map<uint64_t, int> freq;
     for (const WeaponInstance& w : out) freq[w.klass]++;
     std::stable_sort(out.begin(), out.end(), [&](const WeaponInstance& a, const WeaponInstance& b) {
@@ -267,7 +313,6 @@ void ProcMem::ScanForSkin(uint32_t skin,
     for (const auto& kv : rejects) worst.emplace_back(kv.second, kv.first);
     std::sort(worst.begin(), worst.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
 
-    last_scan_report.clear();
     char line[160];
     for (size_t i = 0; i < worst.size() && i < 4; ++i) {
         std::snprintf(line, sizeof(line), "%s (%d)", worst[i].second.c_str(), worst[i].first);
@@ -275,4 +320,17 @@ void ProcMem::ScanForSkin(uint32_t skin,
         last_scan_report += line;
     }
     if (last_scan_report.empty()) last_scan_report = "no structural rejects";
+}
+
+void ProcMem::ScanForSkin(uint32_t skin,
+                          std::vector<WeaponInstance>& out,
+                          const std::function<void(uint64_t, uint64_t)>& progress,
+                          std::atomic<bool>& cancel) {
+    ScanInternal(skin, true, out, progress, cancel);
+}
+
+void ProcMem::ScanStructural(std::vector<WeaponInstance>& out,
+                             const std::function<void(uint64_t, uint64_t)>& progress,
+                             std::atomic<bool>& cancel) {
+    ScanInternal(0, false, out, progress, cancel);
 }

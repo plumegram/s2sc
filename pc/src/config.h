@@ -13,15 +13,15 @@ struct Offset {
     explicit operator bool() const { return set; }
 };
 
-struct LayoutWeaponController {
-    Offset owner             = {false, 0}; // PlayerController*
-    Offset material_controller = {false, 0}; // WeaponMaterialController*
-    Offset skin_id           = {false, 0}; // GFGACECHEBHCGAG
-};
-
-struct LayoutMaterialController {
-    Offset weapon_id = {false, 0}; // FFABDHFDBHCCHGB
-    Offset skin_id   = {false, 0}; // GFGACECHEBHCGAG
+// PlayerAnimationData (TypeDefIndex 22204 in the 1.1.0 x64 dump) holds the
+// local player's weapon state in one object - there is no second controller to
+// chase through a pointer, unlike the 2022 build.
+struct LayoutPlayerAnimation {
+    Offset weapon_id         = {false, 0}; // byte  WeaponId.Raw  (struct wraps one byte)
+    Offset skin_id           = {false, 0}; // int   WeaponSkinId
+    Offset magazine_capacity = {false, 0}; // byte  MagazineCapacity
+    Offset ammo              = {false, 0}; // byte  Ammo
+    Offset rest_ammo         = {false, 0}; // ushort RestAmmo
 };
 
 struct Config {
@@ -31,7 +31,7 @@ struct Config {
     std::string adb_path = "adb";
     std::string serial;
     std::string process_name = "com.axlebolt.standoff2";
-    std::string module_name  = "libil2cpp.so";
+    std::string module_name  = "libunity.so";
     int         port         = 31337;
     std::string remote_agent = "/data/local/tmp/s2sc_agent";
 
@@ -40,12 +40,10 @@ struct Config {
     std::string skins_enum;
 
     // layout
-    LayoutWeaponController   weapon_controller;
-    LayoutMaterialController material_controller;
+    LayoutPlayerAnimation player_animation;
 
-    // Il2CppClass instances may live on the managed heap rather than inside
-    // libil2cpp; only enable this when the build is known to keep them in the
-    // module image.
+    // Il2CppClass instances may live on the managed heap rather than inside the
+    // module image; only enable this when the build is known to keep them there.
     bool klass_in_module = false;
 
     // ui
@@ -56,8 +54,7 @@ struct Config {
 
     // true when every offset needed for a skin write is present
     bool LayoutComplete() const {
-        return weapon_controller.skin_id && material_controller.skin_id &&
-               weapon_controller.material_controller && weapon_controller.owner;
+        return player_animation.weapon_id && player_animation.skin_id;
     }
 
     std::string DescribeMissing() const;
