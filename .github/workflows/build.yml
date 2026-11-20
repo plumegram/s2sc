@@ -1,0 +1,106 @@
+name: build
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+env:
+  CMAKE_BUILD_PARALLEL_LEVEL: 4
+
+jobs:
+  pc:
+    name: pc / windows x64
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: configure
+        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+
+      - name: build
+        run: cmake --build build --config Release --parallel
+
+      - name: check output
+        run: |
+          $exe = "build/pc/Release/s2sc.exe"
+          if (!(Test-Path $exe)) { throw "s2sc.exe was not produced" }
+          Get-Item $exe | Format-List Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: s2sc-pc
+          path: build/pc/Release/s2sc.exe
+          if-no-files-found: error
+
+  agent:
+    name: agent / android arm64
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: resolve ndk
+        run: |
+          NDK="${ANDROID_NDK_LATEST_HOME:-}"
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            NDK="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | sort -V | tail -1)"
+          fi
+          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
+            echo "no Android NDK on this runner"; exit 1
+          fi
+          echo "NDK=$NDK" >> "$GITHUB_ENV"
+          echo "using NDK at $NDK"
+
+      - name: configure
+        run: |
+          cmake -S agent -B agent/build \
+            -DCMAKE_TOOLCHAIN_FILE="$NDK/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-21 \
+            -DANDROID_STL=c++_static \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: build
+        run: cmake --build agent/build --parallel
+
+      - name: check output
+        run: |
+          ls -l agent/build/s2sc_agent
+          file agent/build/s2sc_agent || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: s2sc-agent
+          path: agent/build/s2sc_agent
+          if-no-files-found: error
+
+  package:
+    name: package
+    needs: [pc, agent]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: s2sc-pc
+          path: dist
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: s2sc-agent
+          path: dist/agent/build
+
+      - name: assemble
+        run: |
+          mkdir -p dist/config
+          cp config/targets.json dist/config/targets.json
+          chmod 755 dist/agent/build/s2sc_agent
+          find dist -type f -printf '%p  %s bytes\n'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: s2sc-win64
+          path: dist
+          if-no-files-found: error

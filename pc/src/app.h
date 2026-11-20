@@ -1,0 +1,82 @@
+#pragma once
+
+#include <atomic>
+#include <cstdint>
+#include <mutex>
+#include <string>
+#include <thread>
+#include <vector>
+
+#include "adb.h"
+#include "agent_client.h"
+#include "config.h"
+#include "log.h"
+#include "proc_mem.h"
+#include "skin_db.h"
+
+struct App {
+    Config     cfg;
+    Log        log;
+    Adb        adb;
+    AgentClient client;
+    ProcMem    mem{client};
+    SkinDb     skins;
+
+    std::string config_path;
+    std::string adb_agent_local; // built agent binary on this machine
+
+    // connection
+    Adb::AgentProcess agentProc;
+    std::vector<AdbDevice> devices;
+    int         device_index = -1;
+    bool        agent_running = false;
+    bool        connected     = false;
+    bool        attached      = false;
+    uint32_t    pid           = 0;
+    ModuleSpan  module;
+
+    // scan job
+    std::thread            scan_thread;
+    std::atomic<bool>      scan_running{false};
+    std::atomic<bool>      scan_cancel{false};
+    std::atomic<uint64_t>  scan_done{0};
+    std::atomic<uint64_t>  scan_total{1};
+    std::mutex             scan_mutex;
+    std::vector<WeaponInstance> scan_result;
+
+    // selection
+    std::vector<WeaponInstance> candidates;
+    int          selected_candidate = -1;
+    WeaponInstance target;
+    bool         has_target = false;
+
+    // skin ui
+    std::string  weapon_filter = "rifle";
+    std::string  selected_weapon = "AKR12";
+    std::string  skin_search;
+    uint32_t     selected_skin = 0;
+    uint32_t     scan_value = 0;
+
+    // misc ui
+    char         manual_addr[32] = "0";
+    uint32_t     manual_value = 0;
+    std::string  status_line;
+
+    ~App();
+
+    bool Init();
+    void Shutdown();
+
+    bool ConnectDevice();
+    void DisconnectDevice();
+    bool AttachGame();
+    void DetachGame();
+
+    void StartScan();
+    void PollScan();
+    bool ApplySkin(uint32_t skin_id);
+    bool RefreshTarget();
+
+    void SaveConfig();
+    std::string ProcessName() const { return cfg.process_name; }
+};

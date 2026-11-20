@@ -1,0 +1,23 @@
+{
+  "build": "standoff2 1.1.0 dump (dump.cs, 2026-11-13) - NOT confirmed against the apk you run",
+  "adb": "adb",
+  "serial": "",
+  "process": "com.axlebolt.standoff2",
+  "module": "libil2cpp.so",
+  "port": 31337,
+  "remote_agent": "/data/local/tmp/s2sc_agent",
+  "skins_json": "C:\\Users\\Kompukter\\Downloads\\Telegram Desktop\\skins (2).json",
+  "skins_enum": "C:\\Users\\Kompukter\\Downloads\\Telegram Desktop\\SkinsID.txt",
+  "auto_apply": false,
+  "layout": {
+    "weapon_controller": {
+      "owner": 32,
+      "material_controller": 208,
+      "skin_id": 216
+    },
+    "material_controller": {
+      "weapon_id": 40,
+      "skin_id": 44
+    }
+  }
+}
