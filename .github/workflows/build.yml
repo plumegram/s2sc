@@ -153,6 +153,8 @@ jobs:
     name: package
     needs: [pc, agent]
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
 
@@ -179,3 +181,21 @@ jobs:
           name: s2sc-win64
           path: dist
           if-no-files-found: error
+
+      # Public, auth-free download link: artifact downloads always need a token,
+      # release assets do not. The tag is reused so the link stays stable.
+      - name: publish release assets
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: build-latest
+          name: s2sc latest build
+          prerelease: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/s2sc.exe
+            dist/agent/build/s2sc_agent_arm64
+            dist/agent/build/s2sc_agent_x64
+            dist/config/targets.json
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
