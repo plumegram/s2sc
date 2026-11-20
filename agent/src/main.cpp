@@ -34,7 +34,7 @@ struct Region {
     uint64_t end;
     uint32_t prot;
     uint32_t offset;
-    char     name[32];
+    char     name[128];
 };
 
 int  g_mem_fd = -1;
@@ -77,12 +77,24 @@ bool send_msg(int fd, uint16_t op, const void* payload, uint32_t len) {
 std::string read_file(const char* path, size_t cap = 1 << 20) {
     int fd = ::open(path, O_RDONLY | O_CLOEXEC);
     if (fd < 0) return {};
+    // /proc is seq_file backed: one read() returns only the first chunk, so a
+    // single 16 MiB read of /proc/<pid>/maps yields ~5 KiB and silently loses
+    // the rest of the map. Keep reading until EOF or the cap.
     std::string out;
     out.resize(cap);
-    ssize_t n = ::read(fd, out.data(), cap);
+    size_t done = 0;
+    while (done < cap) {
+        ssize_t n = ::read(fd, out.data() + done, cap - done);
+        if (n < 0) {
+            if (errno == EINTR) continue;
+            break;
+        }
+        if (n == 0) break;
+        done += static_cast<size_t>(n);
+    }
     ::close(fd);
-    if (n <= 0) return {};
-    out.resize(static_cast<size_t>(n));
+    if (done == 0) return {};
+    out.resize(done);
     return out;
 }
 
@@ -197,7 +209,18 @@ void on_hello(int fd) {
     r.proto     = kProtoVersion;
     r.pid_max   = 32768;
     r.page_size = static_cast<uint32_t>(::sysconf(_SC_PAGESIZE));
-    std::snprintf(r.build, sizeof(r.build), "s2sc-agent/1 %s", "arm64");
+#if defined(__aarch64__)
+    constexpr const char* kArch = "arm64";
+#elif defined(__x86_64__)
+    constexpr const char* kArch = "x86_64";
+#elif defined(__arm__)
+    constexpr const char* kArch = "arm32";
+#elif defined(__i386__)
+    constexpr const char* kArch = "x86";
+#else
+    constexpr const char* kArch = "unknown";
+#endif
+    std::snprintf(r.build, sizeof(r.build), "s2sc-agent/1 %s", kArch);
     send_msg(fd, OpHello, &r, sizeof(r));
 }
 
@@ -262,7 +285,7 @@ void on_regions(int fd) {
         e.end    = r.end;
         e.prot   = r.prot;
         e.offset = r.offset;
-        std::memcpy(e.name, r.name, sizeof(e.name));
+        std::snprintf(e.name, sizeof(e.name), "%s", r.name);
         out.push_back(e);
     }
     send_msg(fd, OpRegions, out.data(), static_cast<uint32_t>(out.size() * sizeof(RegionEntry)));

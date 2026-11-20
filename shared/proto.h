@@ -46,7 +46,10 @@ struct RegionEntry {
     uint64_t end;
     uint32_t prot;   // kProtRead | kProtWrite | kProtExec
     uint32_t offset; // file offset of the mapping (informational)
-    char     name[32];
+    // 128, not 32: APK paths such as
+    // /data/app/com.axlebolt.standoff2-.../lib/arm64/libunity.so exceed 32 bytes
+    // and the truncated name cannot be matched against a module name.
+    char     name[128];
 };
 
 struct ChainStep {
