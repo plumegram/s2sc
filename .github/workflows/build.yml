@@ -170,7 +170,8 @@ jobs:
         run: |
           mkdir -p dist/config
           cp config/targets.json dist/config/targets.json
-          chmod 755 dist/agent/build/s2sc_agent
+          ls -l dist dist/agent/build
+          chmod 755 dist/agent/build/s2sc_agent_arm64 dist/agent/build/s2sc_agent_x64
           find dist -type f -printf '%p  %s bytes\n'
 
       - uses: actions/upload-artifact@v4
