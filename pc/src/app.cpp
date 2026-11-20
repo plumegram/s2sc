@@ -43,6 +43,31 @@ std::string PickExisting(const std::vector<std::string>& relatives) {
     return {};
 }
 
+// e_machine of a remote ELF header: 0x3e = x86-64, 0xb7 = AArch64, 0x28 = ARM32.
+// Returns the raw value, or -1 when the header cannot be read.
+int RemoteElfMachine(const Adb& adb, const std::string& path, std::string& why) {
+    std::string out, err;
+    if (!adb.Shell("od -An -tx1 -j18 -N2 " + path, out, err)) {
+        why = err.empty() ? "od failed" : err;
+        return -1;
+    }
+    unsigned lo = 0, hi = 0;
+    if (std::sscanf(out.c_str(), "%x %x", &lo, &hi) != 2) {
+        why = "unexpected od output: " + out;
+        return -1;
+    }
+    return static_cast<int>(lo | (hi << 8));
+}
+
+const char* MachineName(int machine) {
+    switch (machine) {
+        case 0x3e: return "x86-64";
+        case 0xb7: return "aarch64";
+        case 0x28: return "arm32";
+        default:   return "unknown";
+    }
+}
+
 } // namespace
 
 App::~App() {
@@ -120,9 +145,9 @@ bool App::ConnectDevice() {
     adb.SetSerial(devices[device_index].serial);
     log.Info("device: %s (%s)", adb.Serial().c_str(), devices[device_index].state.c_str());
 
-    // Emulators are x86_64, phones are arm64. Pick the matching agent binary;
-    // ARM translation would run the arm64 one on an emulator, but natively is
-    // faster and less fragile.
+    // Emulators are x86_64, phones are arm64. Pick the matching agent binary.
+    // Never fall back to the other ABI: the guest cannot exec a foreign ELF and
+    // the only symptom is "not executable: 64-bit ELF file" much later.
     std::string abi, shell_err;
     if (adb.Shell("getprop ro.product.cpu.abi", abi, shell_err))
         log.Info("abi: %s", abi.c_str());
@@ -131,8 +156,8 @@ bool App::ConnectDevice() {
 
     const bool want_x64 = abi.find("x86") != std::string::npos || abi.find("i686") != std::string::npos;
     agent_binary = want_x64
-        ? PickExisting({"agent\\build\\s2sc_agent_x64", "agent\\build\\s2sc_agent_arm64", "agent\\build\\s2sc_agent"})
-        : PickExisting({"agent\\build\\s2sc_agent_arm64", "agent\\build\\s2sc_agent_x64", "agent\\build\\s2sc_agent"});
+        ? PickExisting({"agent\\build\\s2sc_agent_x64", "agent\\build\\s2sc_agent"})
+        : PickExisting({"agent\\build\\s2sc_agent_arm64", "agent\\build\\s2sc_agent"});
 
     root_mode = adb.ProbeRoot();
     const bool use_su = (root_mode == 1);
@@ -157,6 +182,26 @@ bool App::ConnectDevice() {
             log.Info("agent pushed: %s", agent_binary.c_str());
     } else {
         log.Warn("no local agent binary found under agent\\build, assuming it is already on the device");
+    }
+
+    // Verify the binary that actually sits on the device matches the guest ABI.
+    // This catches a stale push and a wrong local build before anything is launched.
+    {
+        std::string why;
+        const int machine = RemoteElfMachine(adb, cfg.remote_agent, why);
+        const int want = want_x64 ? 0x3e : 0xb7;
+        if (machine < 0) {
+            log.Warn("agent ABI check skipped: %s", why.c_str());
+        } else if (machine != want) {
+            std::string msg = std::string("agent ABI mismatch: device is ") + (want_x64 ? "x86-64" : "aarch64") +
+                              ", binary on device is " + MachineName(machine) +
+                              " (" + cfg.remote_agent + ")";
+            log.Error("%s", msg.c_str());
+            status_line = msg;
+            return false;
+        } else {
+            log.Ok("agent ABI ok: %s", MachineName(machine));
+        }
     }
 
     std::string proc_err;
