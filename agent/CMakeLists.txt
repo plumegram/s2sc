@@ -10,5 +10,4 @@ target_include_directories(s2sc_agent PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../sha
 # Fully static C++ runtime: the binary must run from /data/local/tmp with no
 # libc++_shared.so shipped alongside.
 target_compile_options(s2sc_agent PRIVATE -O2 -fno-exceptions -fno-rtti -Wall -Wextra)
-target_link_options(s2sc_agent PRIVATE -static-libstdc++)
 target_link_libraries(s2sc_agent PRIVATE log)
