@@ -212,24 +212,26 @@ bool App::ConnectDevice() {
     }
     agent_running = true;
 
+    // `adb forward` accepts the local TCP connection even when nothing is
+    // listening on the device yet, so a successful Connect() proves nothing: the
+    // agent may still be starting. Handshake inside the loop, otherwise the first
+    // attempt races the agent and fails with "recv header failed".
+    s2sc::HelloReply hello{};
     bool ok = false;
-    for (int i = 0; i < 24; ++i) {
-        if (client.Connect("127.0.0.1", cfg.port, err)) { ok = true; break; }
+    for (int i = 0; i < 40; ++i) {
+        if (client.Connect("127.0.0.1", cfg.port, err)) {
+            std::string herr;
+            if (client.Hello(hello, herr)) { ok = true; break; }
+            err = herr;
+            client.Disconnect();
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
     if (!ok) {
         std::string out = agentProc.Output();
-        log.Error("agent connect: %s", err.c_str());
+        log.Error("agent handshake: %s", err.c_str());
         if (!out.empty()) log.Error("agent output: %s", out.c_str());
         status_line = err;
-        return false;
-    }
-
-    s2sc::HelloReply hello{};
-    if (!client.Hello(hello, err)) {
-        log.Error("handshake: %s", err.c_str());
-        status_line = err;
-        client.Disconnect();
         return false;
     }
 
