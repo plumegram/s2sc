@@ -91,6 +91,7 @@ bool Config::Load(const std::string& path, std::string& err) {
     klass_in_module = root.Bool("klass_in_module", klass_in_module);
 
     if (const json::Value* layout = root.Find("layout")) {
+        class_name = layout->Str("class", class_name);
         if (const json::Value* pa = layout->Find("player_animation")) {
             ReadOffset(*pa, "weapon_id", player_animation.weapon_id);
             ReadOffset(*pa, "skin_id", player_animation.skin_id);
@@ -117,6 +118,7 @@ bool Config::Save(const std::string& path, std::string& err) const {
     o << "  \"auto_apply\": " << (auto_apply ? "true" : "false") << ",\n";
     o << "  \"klass_in_module\": " << (klass_in_module ? "true" : "false") << ",\n";
     o << "  \"layout\": {\n";
+    o << "    \"class\": \"" << JsonEscape(class_name) << "\",\n";
     o << "    \"player_animation\": {\n";
     o << "      \"weapon_id\": " << OffsetToJson(player_animation.weapon_id) << ",\n";
     o << "      \"skin_id\": " << OffsetToJson(player_animation.skin_id) << ",\n";

@@ -41,6 +41,8 @@ struct Config {
 
     // layout
     LayoutPlayerAnimation player_animation;
+    // Il2CppClass the skinchanger targets; the agent resolves it by this name.
+    std::string class_name = "PlayerAnimationData";
 
     // Il2CppClass instances may live on the managed heap rather than inside the
     // module image; only enable this when the build is known to keep them there.

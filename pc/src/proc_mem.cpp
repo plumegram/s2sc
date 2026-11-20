@@ -181,7 +181,7 @@ bool ProcMem::WriteSkin(const WeaponInstance& w, uint32_t skin, std::string& err
     return true;
 }
 
-void ProcMem::ScanInternal(uint32_t seed, bool use_seed,
+void ProcMem::ScanInternal(uint32_t seed,
                            std::vector<WeaponInstance>& out,
                            const std::function<void(uint64_t, uint64_t)>& progress,
                            std::atomic<bool>& cancel) {
@@ -280,19 +280,12 @@ void ProcMem::ScanInternal(uint32_t seed, bool use_seed,
                     rejects[why]++;
             };
 
-            if (use_seed) {
-                for (uint32_t i = 0; i + 4 <= iter_len; i += 4) {
-                    uint32_t v = 0;
-                    std::memcpy(&v, buf.data() + i, sizeof(v));
-                    if (v != seed) continue;
-                    if (i < skin_off) continue;
-                    consider(addr_base + i - skin_off);
-                }
-            } else {
-                for (uint32_t i = 0; i + 4 <= iter_len; i += 4) {
-                    if ((addr_base + i) & 7ull) continue; // managed objects are 8-aligned
-                    consider(addr_base + i);
-                }
+            for (uint32_t i = 0; i + 4 <= iter_len; i += 4) {
+                uint32_t v = 0;
+                std::memcpy(&v, buf.data() + i, sizeof(v));
+                if (v != seed) continue;
+                if (i < skin_off) continue;
+                consider(addr_base + i - skin_off);
             }
 
             done += iter_len;
@@ -326,11 +319,83 @@ void ProcMem::ScanForSkin(uint32_t skin,
                           std::vector<WeaponInstance>& out,
                           const std::function<void(uint64_t, uint64_t)>& progress,
                           std::atomic<bool>& cancel) {
-    ScanInternal(skin, true, out, progress, cancel);
+    ScanInternal(skin, out, progress, cancel);
 }
 
-void ProcMem::ScanStructural(std::vector<WeaponInstance>& out,
-                             const std::function<void(uint64_t, uint64_t)>& progress,
-                             std::atomic<bool>& cancel) {
-    ScanInternal(0, false, out, progress, cancel);
+bool ProcMem::ScanBySkinSet(const std::vector<uint32_t>& ids,
+                            std::vector<WeaponInstance>& out, std::string& err) {
+    out.clear();
+    last_scan_report.clear();
+
+    const LayoutPlayerAnimation& L = m_cfg.player_animation;
+    if (!L.weapon_id || !L.skin_id) { err = "layout incomplete"; return false; }
+
+    std::vector<uint64_t> objs;
+    if (!m_client.ScanObjects(L.skin_id.Get(), L.weapon_id.Get(),
+                              L.magazine_capacity ? L.magazine_capacity.Get() : 0,
+                              L.ammo ? L.ammo.Get() : 0,
+                              L.rest_ammo ? L.rest_ammo.Get() : 0,
+                              ids, kMaxCandidates, objs, err))
+        return false;
+
+    std::unordered_map<std::string, int> rejects;
+    for (uint64_t obj : objs) {
+        WeaponInstance w;
+        std::string why;
+        if (Validate(obj, w, why, /*strict=*/true))
+            out.push_back(w);
+        else if (!why.empty())
+            rejects[why]++;
+    }
+
+    std::vector<std::pair<int, std::string>> worst;
+    worst.reserve(rejects.size());
+    for (const auto& kv : rejects) worst.emplace_back(kv.second, kv.first);
+    std::sort(worst.begin(), worst.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    char line[160];
+    for (size_t i = 0; i < worst.size() && i < 4; ++i) {
+        std::snprintf(line, sizeof(line), "%s (%d)", worst[i].second.c_str(), worst[i].first);
+        if (!last_scan_report.empty()) last_scan_report += "; ";
+        last_scan_report += line;
+    }
+    if (last_scan_report.empty())
+        last_scan_report = std::to_string(objs.size()) + " raw hits, all valid";
+    return true;
+}
+
+bool ProcMem::ScanByClass(const std::string& class_name, uint64_t& klass,
+                          std::vector<WeaponInstance>& out, std::string& err) {
+    out.clear();
+    last_scan_report.clear();
+    klass = 0;
+
+    std::vector<uint64_t> objs;
+    if (!m_client.ScanClass(class_name, 256, klass, objs, err)) return false;
+
+    // The klass pointer already proves what the object is, so only the cheap
+    // sanity checks run here - a knife at rest is a valid target too.
+    std::unordered_map<std::string, int> rejects;
+    for (uint64_t obj : objs) {
+        WeaponInstance w;
+        std::string why;
+        if (Validate(obj, w, why, /*strict=*/false))
+            out.push_back(w);
+        else if (!why.empty())
+            rejects[why]++;
+    }
+
+    std::vector<std::pair<int, std::string>> worst;
+    worst.reserve(rejects.size());
+    for (const auto& kv : rejects) worst.emplace_back(kv.second, kv.first);
+    std::sort(worst.begin(), worst.end(), [](const auto& a, const auto& b) { return a.first > b.first; });
+
+    char line[160];
+    for (size_t i = 0; i < worst.size() && i < 4; ++i) {
+        std::snprintf(line, sizeof(line), "%s (%d)", worst[i].second.c_str(), worst[i].first);
+        if (!last_scan_report.empty()) last_scan_report += "; ";
+        last_scan_report += line;
+    }
+    if (last_scan_report.empty()) last_scan_report = "all objects valid";
+    return true;
 }

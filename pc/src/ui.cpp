@@ -204,8 +204,7 @@ void DrawSkinchanger(App& app) {
     } else {
         ImGui::TextColored(kDim, "target not selected");
         ImGui::SameLine();
-        if (ImGui::SmallButton("scan structural")) {
-            app.scan_structural = true;
+        if (ImGui::SmallButton("scan for the class")) {
             app.StartScan();
         }
     }
@@ -254,6 +253,22 @@ void DrawTargets(App& app) {
     ImGui::SameLine();
     ImGui::TextDisabled("// build %s", app.cfg.build_tag.c_str());
 
+    ImGui::SetNextItemWidth(260);
+    char cls[64];
+    std::snprintf(cls, sizeof(cls), "%s", app.cfg.class_name.c_str());
+    if (ImGui::InputText("class", cls, sizeof(cls))) app.cfg.class_name = cls;
+    ImGui::SameLine();
+    if (!app.scan_running.load()) {
+        if (ImGui::SmallButton("scan by class")) {
+            app.scan_class_mode = true;
+            app.StartScan();
+        }
+    } else {
+        ImGui::TextDisabled("busy");
+    }
+    if (app.class_klass)
+        ImGui::TextDisabled("class resolved at 0x%llX", static_cast<unsigned long long>(app.class_klass));
+
     DrawOffsetRow("player_animation.weapon_id", app.cfg.player_animation.weapon_id);
     DrawOffsetRow("player_animation.skin_id", app.cfg.player_animation.skin_id);
     DrawOffsetRow("player_animation.magazine_capacity", app.cfg.player_animation.magazine_capacity);
@@ -278,10 +293,12 @@ void DrawTargets(App& app) {
     int sv = static_cast<int>(app.scan_value);
     if (ImGui::InputInt("skin id to find", &sv)) app.scan_value = static_cast<uint32_t>(sv);
     ImGui::SameLine();
-    ImGui::Checkbox("structural (ignore seed)", &app.scan_structural);
-    ImGui::SameLine();
+    ImGui::TextDisabled("// fallback seed");
     if (!app.scan_running.load()) {
-        if (ImGui::Button("Scan")) app.StartScan();
+        if (ImGui::Button("Scan")) {
+            app.scan_class_mode = false;
+            app.StartScan();
+        }
     } else {
         if (ImGui::Button("Cancel")) app.scan_cancel = true;
     }

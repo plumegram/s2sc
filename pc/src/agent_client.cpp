@@ -3,6 +3,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 
@@ -198,6 +199,88 @@ bool AgentClient::Chain(const std::vector<ChainStep>& steps, ChainReply& out, st
         return false;
     }
     std::memcpy(&out, buf.data(), sizeof(out));
+    return true;
+}
+
+void AgentClient::SetRecvTimeout(int ms) {
+    if (!m_sock) return;
+    DWORD tv = static_cast<DWORD>(ms);
+    ::setsockopt(static_cast<SOCKET>(m_sock), SOL_SOCKET, SO_RCVTIMEO,
+                 reinterpret_cast<const char*>(&tv), sizeof(tv));
+}
+
+bool AgentClient::ScanClass(const std::string& name, uint32_t max_hits, uint64_t& klass,
+                            std::vector<uint64_t>& objs, std::string& err) {
+    ScanClassReq req{};
+    std::snprintf(req.name, sizeof(req.name), "%s", name.c_str());
+    req.max_hits = max_hits;
+
+    // The device walks the whole address space; give it minutes, not the 4 s the
+    // ordinary round trips get.
+    SetRecvTimeout(180000);
+    bool ok = Send(OpScanClass, &req, sizeof(req));
+    std::vector<uint8_t> buf;
+    ok = ok && Recv(OpScanClass, buf);
+    SetRecvTimeout(4000);
+
+    if (!ok) { err = m_last_error; return false; }
+    if (buf.size() < sizeof(ScanClassReply)) { err = "short ScanClass reply"; return false; }
+
+    ScanClassReply rep{};
+    std::memcpy(&rep, buf.data(), sizeof(rep));
+    klass = rep.klass;
+    if (rep.status != 0) {
+        err = rep.klass ? "scan failed" : ("class not found: " + name);
+        return false;
+    }
+    const size_t avail = (buf.size() - sizeof(rep)) / sizeof(uint64_t);
+    const size_t n = std::min<size_t>(rep.count, avail);
+    objs.resize(n);
+    if (n) std::memcpy(objs.data(), buf.data() + sizeof(rep), n * sizeof(uint64_t));
+    return true;
+}
+
+bool AgentClient::ScanObjects(uint32_t skin_off, uint32_t weapon_off, uint32_t mag_off,
+                              uint32_t ammo_off, uint32_t rest_off,
+                              const std::vector<uint32_t>& ids, uint32_t max_hits,
+                              std::vector<uint64_t>& objs, std::string& err) {
+    if (ids.empty()) { err = "empty id set"; return false; }
+    const uint32_t n = static_cast<uint32_t>(std::min<size_t>(ids.size(), kMaxScanIds));
+
+    ScanObjectsReq req{};
+    req.skin_off   = skin_off;
+    req.weapon_off = weapon_off;
+    req.mag_off    = mag_off;
+    req.ammo_off   = ammo_off;
+    req.rest_off   = rest_off;
+    req.id_count   = n;
+    req.max_hits   = max_hits;
+
+    std::vector<uint8_t> payload(sizeof(req) + n * sizeof(uint32_t));
+    std::memcpy(payload.data(), &req, sizeof(req));
+    std::memcpy(payload.data() + sizeof(req), ids.data(), n * sizeof(uint32_t));
+
+    SetRecvTimeout(180000);
+    bool ok = Send(OpScanObjects, payload.data(), static_cast<uint32_t>(payload.size()));
+    std::vector<uint8_t> buf;
+    ok = ok && Recv(OpScanObjects, buf);
+    SetRecvTimeout(4000);
+
+    if (!ok) { err = m_last_error; return false; }
+    if (buf.size() < sizeof(ScanObjectsReply)) { err = "short ScanObjects reply"; return false; }
+
+    ScanObjectsReply rep{};
+    std::memcpy(&rep, buf.data(), sizeof(rep));
+    if (rep.status != 0) {
+        char tmp[64];
+        std::snprintf(tmp, sizeof(tmp), "scan failed (errno %d)", -rep.status);
+        err = tmp;
+        return false;
+    }
+    const size_t avail = (buf.size() - sizeof(rep)) / sizeof(uint64_t);
+    const size_t got = std::min<size_t>(rep.count, avail);
+    objs.resize(got);
+    if (got) std::memcpy(objs.data(), buf.data() + sizeof(rep), got * sizeof(uint64_t));
     return true;
 }
 

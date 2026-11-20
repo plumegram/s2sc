@@ -62,18 +62,23 @@ public:
                      const std::function<void(uint64_t, uint64_t)>& progress,
                      std::atomic<bool>& cancel);
 
-    // Same walk, but seeded only by the structure: a plausible weapon byte, a
-    // sane magazine/ammo/reserve triple and a klass pointer. Slower and noisier
-    // than a seeded scan, but it works when the equipped skin id is unknown.
-    void ScanStructural(std::vector<WeaponInstance>& out,
-                        const std::function<void(uint64_t, uint64_t)>& progress,
-                        std::atomic<bool>& cancel);
+    // The exact path: the agent resolves the Il2CppClass by name on the device
+    // and returns the objects that point at it. No heuristics, no gigabytes over
+    // adb. `klass` is filled even when no object is currently alive.
+    bool ScanByClass(const std::string& class_name, uint64_t& klass,
+                     std::vector<WeaponInstance>& out, std::string& err);
+
+    // The workhorse: the agent walks the heap once and keeps every 8-aligned
+    // address whose weapon byte is sane and whose skin id belongs to the
+    // catalogue. Needs no class metadata, so it works on any build.
+    bool ScanBySkinSet(const std::vector<uint32_t>& ids,
+                       std::vector<WeaponInstance>& out, std::string& err);
 
 private:
     bool ReadRange(uint64_t addr, void* dst, uint32_t len);
 
     // Shared tail of both scans: chunk walk + report assembly.
-    void ScanInternal(uint32_t seed, bool use_seed,
+    void ScanInternal(uint32_t seed,
                       std::vector<WeaponInstance>& out,
                       const std::function<void(uint64_t, uint64_t)>& progress,
                       std::atomic<bool>& cancel);

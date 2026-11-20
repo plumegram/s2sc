@@ -324,18 +324,48 @@ void App::StartScan() {
     scan_total   = 1;
     scan_running = true;
 
-    const uint32_t value      = scan_value;
-    const bool     structural = scan_structural;
-    scan_thread = std::thread([this, value, structural]() {
+    const uint32_t value = scan_value;
+    const bool     by_class = scan_class_mode;
+    const std::string class_name = cfg.class_name;
+    scan_thread = std::thread([this, value, by_class, class_name]() {
         std::vector<WeaponInstance> hits;
         auto progress = [this](uint64_t done, uint64_t total) {
             scan_done  = done;
             scan_total = total ? total : 1;
         };
-        if (structural)
-            mem.ScanStructural(hits, progress, scan_cancel);
-        else
+
+        std::string err;
+        if (by_class) {
+            // Exact, but depends on the build materialising Il2CppClass objects.
+            uint64_t klass = 0;
+            if (mem.ScanByClass(class_name, klass, hits, err)) {
+                class_klass = klass;
+                if (hits.empty())
+                    log.Warn("class %s is at 0x%llX but has no live instance "
+                             "(enter a match and scan again)", class_name.c_str(),
+                             static_cast<unsigned long long>(klass));
+            } else {
+                log.Warn("class scan: %s", err.c_str());
+            }
+        } else {
+            // Primary path: the agent walks the heap once and keeps every object
+            // whose skin id is a real catalogue id. No class metadata involved, so
+            // it does not depend on how this build lays out Il2CppClass.
+            std::vector<uint32_t> ids;
+            ids.reserve(skins.Size());
+            for (const SkinEntry& s : skins.All()) ids.push_back(s.id);
+
+            if (ids.empty())
+                log.Warn("skin catalogue is empty, the field scan has nothing to match");
+            else if (!mem.ScanBySkinSet(ids, hits, err))
+                log.Warn("device scan: %s", err.c_str());
+        }
+
+        // Fallback for when the user knows the exact skin id that is equipped.
+        if (hits.empty() && value != 0) {
+            log.Info("falling back to a seeded scan for skin %u", value);
             mem.ScanForSkin(value, hits, progress, scan_cancel);
+        }
 
         {
             std::lock_guard<std::mutex> lock(scan_mutex);

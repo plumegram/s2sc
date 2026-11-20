@@ -15,12 +15,14 @@
 #include <unistd.h>
 #include <dirent.h>
 
+#include <algorithm>
 #include <cerrno>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <string>
+#include <unordered_set>
 #include <vector>
 
 #include "proto.h"
@@ -40,6 +42,11 @@ struct Region {
 int  g_mem_fd = -1;
 int  g_pid    = 0;
 std::vector<Region> g_regions;
+std::vector<uint64_t> g_region_starts; // parallel to g_regions, for binary search
+// Resolving a class costs three passes over the address space; the answer is
+// stable for the life of the process, so keep it.
+std::string g_class_name;
+uint64_t    g_class_addr = 0;
 
 // ---------------------------------------------------------------- socket io
 
@@ -132,6 +139,11 @@ bool parse_maps() {
         }
         g_regions.push_back(r);
     }
+    std::sort(g_regions.begin(), g_regions.end(),
+              [](const Region& a, const Region& b) { return a.start < b.start; });
+    g_region_starts.clear();
+    g_region_starts.reserve(g_regions.size());
+    for (const Region& r : g_regions) g_region_starts.push_back(r.start);
     return !g_regions.empty();
 }
 
@@ -141,6 +153,17 @@ bool range_ok(uint64_t addr, uint64_t len) {
         if (addr >= r.start && addr + len <= r.end && (r.prot & kProtRead)) return true;
     }
     return false;
+}
+
+// Same question, O(log n): a klass pointer must land inside a mapped region.
+bool mapped(uint64_t addr, uint64_t len) {
+    if (g_region_starts.empty()) return range_ok(addr, len);
+    auto it = std::upper_bound(g_region_starts.begin(), g_region_starts.end(), addr);
+    if (it == g_region_starts.begin()) return false;
+    const size_t i = static_cast<size_t>(it - g_region_starts.begin()) - 1;
+    if (i >= g_regions.size()) return false;
+    const Region& r = g_regions[i];
+    return addr + len <= r.end && (r.prot & kProtRead);
 }
 
 bool mem_read(uint64_t addr, void* dst, size_t len) {
@@ -200,6 +223,8 @@ void detach() {
     if (g_mem_fd >= 0) { ::close(g_mem_fd); g_mem_fd = -1; }
     g_pid = 0;
     g_regions.clear();
+    g_class_name.clear();
+    g_class_addr = 0;
 }
 
 // ----------------------------------------------------------------- handlers
@@ -349,6 +374,271 @@ void on_chain(int fd, const std::vector<uint8_t>& payload) {
     send_msg(fd, OpChain, &rep, sizeof(rep));
 }
 
+// ------------------------------------------------------- class-anchored scan
+//
+// The PC cannot afford to pull the whole heap over adb, so the search runs here:
+// the class name string is located inside the module image, the Il2CppClass that
+// points at it is found next, and then every object whose first qword is that
+// class. Only the object addresses travel back.
+
+bool printable(const char* s, size_t cap) {
+    size_t n = 0;
+    while (n < cap && s[n]) {
+        if (static_cast<unsigned char>(s[n]) < 32 || static_cast<unsigned char>(s[n]) > 126) return false;
+        ++n;
+    }
+    return n > 0 && n < cap;
+}
+
+// Shadow and guard mappings are as large as the heap and hold no objects.
+bool object_bearing(const Region& r) {
+    if (!(r.prot & kProtRead) || (r.prot & kProtExec)) return false;
+    if (std::strstr(r.name, "cfi shadow")) return false;
+    if (std::strstr(r.name, "guard")) return false;
+    return true;
+}
+
+// Managed objects only ever live in anonymous writable memory. Shared libraries
+// and asset images carry tables that look exactly like an object (a weapon id
+// next to a skin id), so they must stay out of the object scan.
+bool heap_region(const Region& r) {
+    if (!(r.prot & kProtRead) || !(r.prot & kProtWrite)) return false;
+    if (r.name[0] != '\0' && r.name[0] != '[') return false;
+    if (std::strstr(r.name, "cfi shadow")) return false;
+    if (std::strstr(r.name, "stack")) return false;
+    if (std::strstr(r.name, "vdso") || std::strstr(r.name, "vvar")) return false;
+    return true;
+}
+
+// Calls cb(address) for every occurrence of `needle` in the mapping. The tail of
+// each chunk is re-read so a match straddling a boundary is still found.
+template <typename F>
+void scan_bytes(const Region& r, const uint8_t* needle, size_t nlen, F&& cb,
+                bool require_string_start = false) {
+    constexpr uint64_t kChunk = 4u << 20;
+    const uint64_t size = r.end - r.start;
+    if (size < nlen) return;
+    std::vector<uint8_t> buf(static_cast<size_t>(kChunk) + nlen);
+    for (uint64_t off = 0; off < size; off += kChunk) {
+        const size_t want = static_cast<size_t>(std::min<uint64_t>(kChunk + nlen, size - off));
+        if (want < nlen) break;
+        if (!mem_read(r.start + off, buf.data(), want)) continue;
+        const size_t last = want - nlen;
+        for (size_t i = 0; i <= last; ++i) {
+            if (buf[i] != needle[0]) continue;
+            if (std::memcmp(buf.data() + i, needle, nlen) != 0) continue;
+            // metadata strings are NUL separated, so a real name starts right
+            // after a NUL. A match at chunk offset 0 cannot be checked; the
+            // overlapping tail read covers that address from the previous chunk.
+            if (require_string_start && (i == 0 || buf[i - 1] != 0)) continue;
+            cb(r.start + off + i);
+        }
+    }
+}
+
+// Same, for an 8-byte value at 8-aligned addresses.
+template <typename F>
+void scan_qword(const Region& r, uint64_t value, F&& cb) {
+    constexpr uint64_t kChunk = 4u << 20;
+    const uint64_t size = r.end - r.start;
+    if (size < sizeof(value)) return;
+    std::vector<uint8_t> buf(static_cast<size_t>(kChunk) + sizeof(value));
+    for (uint64_t off = 0; off < size; off += kChunk) {
+        const size_t want = static_cast<size_t>(std::min<uint64_t>(kChunk + sizeof(value), size - off));
+        if (!mem_read(r.start + off, buf.data(), want)) continue;
+        for (size_t i = 0; i + sizeof(value) <= want; i += sizeof(value)) {
+            uint64_t v = 0;
+            std::memcpy(&v, buf.data() + i, sizeof(v));
+            if (v == value) cb(r.start + off + i);
+        }
+    }
+}
+
+uint64_t resolve_class_pass(const char* name, bool strict) {
+    const std::string needle = std::string(name) + '\0';
+
+    // 1. the name string itself. Not just in the .so: il2cpp may keep its own copy
+    //    of the metadata on the heap, and the class points at whichever copy the
+    //    runtime actually uses. A match must start a string, otherwise
+    //    "Transform" also matches inside "RectTransform".
+    std::vector<uint64_t> strings;
+    for (const Region& r : g_regions) {
+        if (!object_bearing(r)) continue;
+        scan_bytes(r, reinterpret_cast<const uint8_t*>(needle.data()), needle.size(),
+                   [&](uint64_t at) {
+                       if (strings.size() < 16) strings.push_back(at);
+                   }, /*require_string_start=*/true);
+    }
+    if (strings.empty()) return 0;
+
+    // 2. the Il2CppClass holding that pointer as its name. Layout from il2cpp.h in
+    //    the dump: +0x00 image, +0x08 gc_desc, +0x10 name, +0x18 namespaze,
+    //    +0x78 klass (a self-reference). The self-reference is the strict test;
+    //    the loose one only checks that the namespaze reads as text.
+    for (uint64_t s : strings) {
+        uint64_t klass = 0;
+        for (const Region& r : g_regions) {
+            if (klass) break;
+            if (!object_bearing(r)) continue;
+            scan_qword(r, s, [&](uint64_t at) {
+                if (klass || at < 0x10) return;
+                const uint64_t cand = at - 0x10;
+                uint64_t hdr[16] = {0}; // up to +0x78
+                if (!mem_read(cand, hdr, sizeof(hdr))) return;
+                if (hdr[2] != s) return;
+                if (strict) {
+                    // il2cpp.h: image at +0x00 and a self-referencing klass at
+                    // +0x78. Only a fully built Il2CppClass passes both.
+                    if (hdr[15] != cand) return;
+                    if (hdr[0] < 0x10000 || (hdr[0] & 7)) return;
+                }
+                // The namespaze is at +0x18 in a class; the metadata records this
+                // build keeps around carry it at +0x08 instead.
+                bool ok = false;
+                for (int i : {3, 1}) {
+                    char ns[96] = {0};
+                    if (hdr[i] < 0x10000) continue;
+                    if (!mem_read(hdr[i], ns, sizeof(ns) - 1)) continue;
+                    if (printable(ns, sizeof(ns) - 1)) { ok = true; break; }
+                }
+                if (!ok) return;
+                klass = cand;
+            });
+        }
+        if (klass) return klass;
+    }
+    return 0;
+}
+
+uint64_t resolve_class(const char* name) {
+    uint64_t k = resolve_class_pass(name, /*strict=*/true);
+    if (!k) k = resolve_class_pass(name, /*strict=*/false);
+    return k;
+}
+
+void on_scan_class(int fd, const std::vector<uint8_t>& payload) {
+    ScanClassReq req{};
+    const size_t copy = std::min(payload.size(), sizeof(req));
+    if (copy) std::memcpy(&req, payload.data(), copy);
+    req.name[sizeof(req.name) - 1] = '\0';
+    if (req.max_hits == 0 || req.max_hits > 4096) req.max_hits = 256;
+
+    ScanClassReply rep{};
+    if (g_mem_fd < 0 || req.name[0] == '\0') {
+        rep.status = -EINVAL;
+        send_msg(fd, OpScanClass, &rep, sizeof(rep));
+        return;
+    }
+
+    rep.klass = (g_class_name == req.name && g_class_addr) ? g_class_addr : resolve_class(req.name);
+    if (rep.klass) {
+        g_class_name = req.name;
+        g_class_addr = rep.klass;
+    } else {
+        rep.status = -ENOENT;
+        send_msg(fd, OpScanClass, &rep, sizeof(rep));
+        return;
+    }
+
+    std::vector<uint64_t> objs;
+    objs.reserve(req.max_hits);
+    for (const Region& r : g_regions) {
+        if (objs.size() >= req.max_hits) break;
+        if (!object_bearing(r)) continue;
+        scan_qword(r, rep.klass, [&](uint64_t at) {
+            if (objs.size() < req.max_hits) objs.push_back(at);
+        });
+    }
+
+    rep.count = static_cast<uint32_t>(objs.size());
+    std::vector<uint8_t> out(sizeof(rep) + objs.size() * sizeof(uint64_t));
+    std::memcpy(out.data(), &rep, sizeof(rep));
+    if (!objs.empty()) std::memcpy(out.data() + sizeof(rep), objs.data(), objs.size() * sizeof(uint64_t));
+    send_msg(fd, OpScanClass, out.data(), static_cast<uint32_t>(out.size()));
+}
+
+void on_scan_objects(int fd, const std::vector<uint8_t>& payload) {
+    ScanObjectsReq req{};
+    ScanObjectsReply rep{};
+    if (payload.size() < sizeof(req)) {
+        rep.status = -EINVAL;
+        send_msg(fd, OpScanObjects, &rep, sizeof(rep));
+        return;
+    }
+    std::memcpy(&req, payload.data(), sizeof(req));
+    if (req.id_count == 0 || req.id_count > kMaxScanIds ||
+        payload.size() < sizeof(req) + req.id_count * sizeof(uint32_t)) {
+        rep.status = -EINVAL;
+        send_msg(fd, OpScanObjects, &rep, sizeof(rep));
+        return;
+    }
+    if (req.max_hits == 0 || req.max_hits > 4096) req.max_hits = 256;
+
+    std::vector<uint32_t> ids(req.id_count);
+    std::memcpy(ids.data(), payload.data() + sizeof(req), req.id_count * sizeof(uint32_t));
+    std::unordered_set<uint32_t> known(ids.begin(), ids.end());
+
+    uint32_t need = std::max(std::max(req.skin_off + 4, req.weapon_off + 1),
+                             std::max(req.mag_off + 1, req.ammo_off + 1));
+    if (req.rest_off) need = std::max(need, req.rest_off + 2);
+    ++need;
+    std::vector<uint64_t> objs;
+
+    for (const Region& r : g_regions) {
+        if (objs.size() >= req.max_hits) break;
+        if (!heap_region(r)) continue;
+        const uint64_t size = r.end - r.start;
+        constexpr uint64_t kChunk = 4u << 20;
+        std::vector<uint8_t> buf(static_cast<size_t>(kChunk) + need);
+        for (uint64_t off = 0; off < size; off += kChunk) {
+            const size_t want = static_cast<size_t>(std::min<uint64_t>(kChunk + need, size - off));
+            if (want < need) break;
+            if (!mem_read(r.start + off, buf.data(), want)) continue;
+            for (size_t i = 0; i + need <= want; i += 8) {
+                // Static definition tables have the same field layout as the
+                // object, so the klass pointer is what tells them apart.
+                uint64_t klass = 0;
+                std::memcpy(&klass, buf.data() + i, sizeof(klass));
+                if (klass < 0x10000 || (klass & 7)) continue;
+                // Il2CppClass objects in this process live in the high arena
+                // (0x77xx...), same as every mapped library. Low addresses are
+                // the app's own tables, which carry the same weapon/skin fields.
+                if (klass < 0x700000000000ull) continue;
+                if (!mapped(klass, 8)) continue;
+
+                const uint8_t w = buf[i + req.weapon_off];
+                if (w == 0 || w > 80) continue;
+
+                uint32_t skin = 0;
+                std::memcpy(&skin, buf.data() + i + req.skin_off, sizeof(skin));
+                if (!known.count(skin)) continue;
+
+                // The ammo triple is the cheapest way to drop the rest of the
+                // look-alikes before they eat the hit budget.
+                const uint32_t mag = buf[i + req.mag_off];
+                const uint32_t ammo = buf[i + req.ammo_off];
+                if (mag > 100) continue;
+                if (mag == 0 ? ammo != 0 : ammo > mag) continue;
+                if (req.rest_off) {
+                    uint16_t rest = 0;
+                    std::memcpy(&rest, buf.data() + i + req.rest_off, sizeof(rest));
+                    if (rest > 999) continue;
+                }
+
+                objs.push_back(r.start + off + i);
+                if (objs.size() >= req.max_hits) break;
+            }
+            if (objs.size() >= req.max_hits) break;
+        }
+    }
+
+    rep.count = static_cast<uint32_t>(objs.size());
+    std::vector<uint8_t> out(sizeof(rep) + objs.size() * sizeof(uint64_t));
+    std::memcpy(out.data(), &rep, sizeof(rep));
+    if (!objs.empty()) std::memcpy(out.data() + sizeof(rep), objs.data(), objs.size() * sizeof(uint64_t));
+    send_msg(fd, OpScanObjects, out.data(), static_cast<uint32_t>(out.size()));
+}
+
 // -------------------------------------------------------------------- main
 
 void serve(int fd) {
@@ -403,6 +693,12 @@ void serve(int fd) {
         }
         case OpChain:
             on_chain(fd, payload);
+            break;
+        case OpScanClass:
+            on_scan_class(fd, payload);
+            break;
+        case OpScanObjects:
+            on_scan_objects(fd, payload);
             break;
         case OpPing: {
             uint64_t t = 0;

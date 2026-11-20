@@ -58,7 +58,8 @@ struct App {
     std::string  skin_search;
     uint32_t     selected_skin = 0;
     uint32_t     scan_value = 0;
-    bool         scan_structural = false; // ignore the seed, match on the structure alone
+    bool         scan_class_mode = false; // scan by Il2CppClass name instead of the id set
+    uint64_t     class_klass = 0;         // resolved Il2CppClass, kept for the session
 
     // post-write watchdog: proves the game does not rewrite the field next tick
     bool         watch_active = false;

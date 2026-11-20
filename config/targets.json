@@ -10,6 +10,7 @@
   "skins_enum": "C:\\Users\\Kompukter\\Downloads\\Telegram Desktop\\SkinsID.txt",
   "auto_apply": false,
   "layout": {
+    "class": "PlayerAnimationData",
     "player_animation": {
       "weapon_id": 208,
       "skin_id": 212,
