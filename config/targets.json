@@ -1,6 +1,6 @@
 {
   "build": "standoff2 1.1.0 dump (dump.cs, 2026-11-13) - NOT confirmed against the apk you run",
-  "adb": "adb",
+  "adb": "C:\\Program Files\\obs-studio\\data\\obs-plugins\\droidcam-obs\\adb\\adb.exe",
   "serial": "",
   "process": "com.axlebolt.standoff2",
   "module": "libil2cpp.so",
