@@ -16,22 +16,67 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # Runs before configure so the log still tells us what the image has when
+      # the build fails.
+      - name: toolchain report
+        shell: pwsh
+        run: |
+          cmake --version | Select-Object -First 1
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          if (Test-Path $vswhere) {
+            Write-Host "vswhere: $vswhere"
+            & $vswhere -latest -products * -property installationPath
+            & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationVersion
+          } else {
+            Write-Host "vswhere not found"
+          }
+          Write-Host "generators:"
+          (cmake --help | Select-String -Pattern '^\s*\*?\s*Visual Studio') | ForEach-Object { $_.Line.Trim() }
+
+      # No -G: CMake picks the newest installed Visual Studio, whatever version
+      # the runner image ships. Pinning "Visual Studio 17 2022" breaks as soon as
+      # the image moves on.
       - name: configure
-        run: cmake -S . -B build -G "Visual Studio 17 2022" -A x64
+        shell: pwsh
+        run: |
+          cmake -S . -B build -A x64
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::warning::Visual Studio generator failed, retrying with Ninja"
+            Remove-Item -Recurse -Force build -ErrorAction SilentlyContinue
+
+            $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+            if (Test-Path $vswhere) {
+              $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+              $devshell = Join-Path $vs "Common7\Tools\Launch-VsDevShell.ps1"
+              if (Test-Path $devshell) {
+                $cwd = Get-Location
+                & $devshell -Arch amd64 -HostArch amd64
+                Set-Location $cwd
+              }
+            }
+            cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+            if ($LASTEXITCODE -ne 0) { exit 1 }
+          }
+          Select-String -Path build/CMakeCache.txt -Pattern '^CMAKE_GENERATOR:' | ForEach-Object { $_.Line }
 
       - name: build
+        shell: pwsh
         run: cmake --build build --config Release --parallel
 
       - name: check output
+        shell: pwsh
         run: |
-          $exe = "build/pc/Release/s2sc.exe"
-          if (!(Test-Path $exe)) { throw "s2sc.exe was not produced" }
+          $exe = "build/bin/s2sc.exe"
+          if (!(Test-Path $exe)) {
+            Get-ChildItem -Recurse -Filter s2sc.exe | ForEach-Object { Write-Host $_.FullName }
+            throw "s2sc.exe was not produced at $exe"
+          }
           Get-Item $exe | Format-List Name, Length
 
       - uses: actions/upload-artifact@v4
         with:
           name: s2sc-pc
-          path: build/pc/Release/s2sc.exe
+          path: build/bin/s2sc.exe
           if-no-files-found: error
 
   agent:
@@ -42,15 +87,29 @@ jobs:
 
       - name: resolve ndk
         run: |
-          NDK="${ANDROID_NDK_LATEST_HOME:-}"
-          if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
-            NDK="$(ls -d "${ANDROID_HOME:-/usr/local/lib/android/sdk}"/ndk/* 2>/dev/null | sort -V | tail -1)"
+          set -u
+          echo "ANDROID_NDK_LATEST_HOME=${ANDROID_NDK_LATEST_HOME:-<unset>}"
+          echo "ANDROID_NDK_HOME=${ANDROID_NDK_HOME:-<unset>}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+
+          NDK=""
+          for candidate in "${ANDROID_NDK_LATEST_HOME:-}" "${ANDROID_NDK_HOME:-}"; do
+            if [ -n "$candidate" ] && [ -d "$candidate" ]; then NDK="$candidate"; break; fi
+          done
+          if [ -z "$NDK" ]; then
+            for root in "${ANDROID_HOME:-}" "/usr/local/lib/android/sdk" "$HOME/android-sdk"; do
+              if [ -z "$root" ] || [ ! -d "$root/ndk" ]; then continue; fi
+              NDK="$(ls -d "$root"/ndk/* 2>/dev/null | sort -V | tail -1)"
+              if [ -n "$NDK" ]; then break; fi
+            done
           fi
           if [ -z "$NDK" ] || [ ! -d "$NDK" ]; then
-            echo "no Android NDK on this runner"; exit 1
+            echo "no Android NDK found; looked at ANDROID_NDK_LATEST_HOME, ANDROID_NDK_HOME, \$ANDROID_HOME/ndk"
+            exit 1
           fi
           echo "NDK=$NDK" >> "$GITHUB_ENV"
           echo "using NDK at $NDK"
+          ls "$NDK/build/cmake/android.toolchain.cmake"
 
       - name: configure
         run: |
